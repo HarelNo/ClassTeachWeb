@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { parse } = require('csv-parse/sync');
 const bcrypt = require('bcryptjs');
-const { initializeDatabase, pool } = require('./database');
+const { Student, Teacher } = require('./models');
 
 function readCsv(filePath, allowedHeaders) {
   return fs.readFile(filePath, 'utf8').then((contents) => parse(contents, {
@@ -27,7 +27,7 @@ function readCsv(filePath, allowedHeaders) {
 function validateTeachers(rows) {
   const seenNames = new Set();
   return rows.map((row, index) => {
-    const fullName = row['full name']?.trim();
+    const fullName = Teacher.validateName(row['full name']);
     const password = row.password;
     const nameKey = fullName?.toLocaleLowerCase('en');
 
@@ -48,7 +48,7 @@ function validateTeachers(rows) {
 function validateStudents(rows) {
   const seenEmails = new Set();
   return rows.map((row, index) => {
-    const fullName = row['full name']?.trim();
+    const fullName = Student.validateName(row['full name']);
     const email = (row['email address'] || row['email adress'] || '').trim();
     const emailKey = email.toLocaleLowerCase('en');
 
@@ -59,11 +59,13 @@ function validateStudents(rows) {
       throw new Error(`Student CSV contains duplicate email "${email}".`);
     }
     seenEmails.add(emailKey);
-    return { fullName, email };
+    const student = new Student({ fullName, email });
+    return { fullName: student.fullName, email: student.email };
   });
 }
 
 async function main() {
+  const { initializeDatabase, pool } = require('./database');
   const teachersPath = path.resolve(process.argv[2] || 'data/teachers.csv');
   const studentsPath = path.resolve(process.argv[3] || 'data/students.csv');
   const teachers = validateTeachers(await readCsv(teachersPath, [['full name', 'password']]));
@@ -117,9 +119,19 @@ async function main() {
   console.log(`Imported ${teachers.length} teachers and ${students.length} students.`);
 }
 
-main()
-  .catch((error) => {
-    console.error('Roster import failed:', error);
-    process.exitCode = 1;
-  })
-  .finally(() => pool.end());
+if (require.main === module) {
+  main()
+    .catch((error) => {
+      console.error('Roster import failed:', error);
+      process.exitCode = 1;
+    })
+    .finally(() => {
+      if (process.env.DATABASE_URL) {
+        const { pool } = require('./database');
+        return pool.end();
+      }
+      return undefined;
+    });
+}
+
+module.exports = { validateTeachers, validateStudents };

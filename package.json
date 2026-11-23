@@ -6,7 +6,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "import:rosters": "node import-rosters.js"
+    "import:rosters": "node import-rosters.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=20"
