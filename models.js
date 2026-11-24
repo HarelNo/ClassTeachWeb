@@ -12,6 +12,20 @@ class Teacher {
   }
 }
 
+class Manager {
+  constructor({ id, fullName, passwordHash }) {
+    this.id = id;
+    this.fullName = Manager.validateName(fullName);
+    this.passwordHash = passwordHash;
+  }
+
+  static validateName(value) {
+    const name = typeof value === 'string' ? value.trim() : '';
+    if (!name || name.length > 120) throw new Error('Manager name must be 1-120 characters.');
+    return name;
+  }
+}
+
 class Student {
   constructor({ id, fullName, email }) {
     this.id = id;
@@ -92,4 +106,4 @@ function evaluateLocation(subject, latitude, longitude, accuracyMeters, maximumA
   };
 }
 
-module.exports = { Teacher, Student, Subject, distanceMeters, evaluateLocation };
+module.exports = { Manager, Teacher, Student, Subject, distanceMeters, evaluateLocation };

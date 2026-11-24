@@ -1,15 +1,18 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { Teacher, Student, Subject, distanceMeters, evaluateLocation } = require('./models');
+const { Manager, Teacher, Student, Subject, distanceMeters, evaluateLocation } = require('./models');
 
 test('domain classes validate and normalize their identifying fields', () => {
+  const manager = new Manager({ id: 4, fullName: '  Morgan Manager ', passwordHash: 'hash' });
   const teacher = new Teacher({ id: 1, fullName: '  Ada Teacher  ', passwordHash: 'hash' });
   const student = new Student({ id: 2, fullName: '  Sam Student ', email: 'sam@example.edu' });
   const subject = new Subject({ id: 3, teacherId: 1, name: '  Biology ', geofenceRadiusMeters: 100 });
 
+  assert.equal(manager.fullName, 'Morgan Manager');
   assert.equal(teacher.fullName, 'Ada Teacher');
   assert.equal(student.fullName, 'Sam Student');
   assert.equal(subject.name, 'Biology');
+  assert.throws(() => new Manager({ fullName: '' }), /Manager name must be 1-120 characters/);
   assert.throws(() => new Student({ fullName: 'Sam', email: 'not-an-email' }), /valid student email/);
   assert.throws(() => new Subject({ name: 'Biology', geofenceRadiusMeters: 5 }), /between 10 and 5000/);
 });

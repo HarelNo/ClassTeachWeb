@@ -9,7 +9,8 @@ const { rateLimit } = require('express-rate-limit');
 const PgSession = require('connect-pg-simple')(session);
 const QRCode = require('qrcode');
 const { initializeDatabase, pool } = require('./database');
-const { Teacher, Student, Subject, evaluateLocation } = require('./models');
+const { validateAccountPassword } = require('./accounts');
+const { Manager, Teacher, Student, Subject, evaluateLocation } = require('./models');
 const { generateText } = require('./services/openai');
 const { similarityDetails } = require('./similarity');
 const { attendanceStatus } = require('./attendance');
@@ -159,6 +160,26 @@ async function requireTeacher(req, res, next) {
   }
 }
 
+async function requireManager(req, res, next) {
+  if (!req.session.managerId) return res.redirect('/manager/login');
+  try {
+    const result = await pool.query(
+      'SELECT 1 FROM manager_logins WHERE manager_id = $1 AND session_id = $2',
+      [req.session.managerId, req.sessionID],
+    );
+    if (result.rowCount !== 1) {
+      return req.session.destroy((error) => {
+        if (error) return next(error);
+        res.clearCookie('classteachweb.sid');
+        res.redirect('/manager/login');
+      });
+    }
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
 function requireStudent(req, res, next) {
   if (!req.session.studentId || !req.session.teachingSessionId) {
     return res.status(401).json({ error: 'Scan your class QR code and select your roster entry first.' });
@@ -181,6 +202,11 @@ function formCsrf(token) {
 function teacherNavigation(name, token) {
   return `<header><p><a href="/teacher">ClassTeachWeb</a> · Signed in as ${escapeHtml(name)}</p>
     <form class="inline" method="post" action="/logout">${formCsrf(token)}<button type="submit">Log out</button></form></header>`;
+}
+
+function managerNavigation(name, token) {
+  return `<header><p><a href="/manager">ClassTeachWeb management</a> · Signed in as ${escapeHtml(name)}</p>
+    <form class="inline" method="post" action="/manager/logout">${formCsrf(token)}<button type="submit">Log out</button></form></header>`;
 }
 
 function values(value) {
@@ -418,7 +444,291 @@ async function subjectPage(req, res, subject) {
 app.get('/', (req, res) => {
   res.send(renderPage('ClassTeachWeb', `<h1>ClassTeachWeb</h1>
     <p>Class tools for attendance, discussion, polls, summaries, and homework feedback.</p>
-    <p><a href="/login">Teacher login</a></p>`));
+    <p><a href="/login">Teacher login</a></p>
+    <p><a href="/manager/login">Management login</a></p>`));
+});
+
+app.get('/manager/login', (req, res) => {
+  const token = csrfTokenFor(req);
+  const message = req.query.error === '1' ? '<p role="alert">Name or password is incorrect.</p>' : '';
+  res.send(renderPage('Management login', `<h1>Management login</h1>${message}
+    <form method="post" action="/manager/login">${formCsrf(token)}
+      <label for="fullName">Manager full name</label><input id="fullName" name="fullName" autocomplete="username" required>
+      <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button>Log in</button></form>
+    <p><a href="/login">Teacher login</a></p>`, token));
+});
+
+app.post('/manager/login', loginLimiter, requireCsrf, async (req, res, next) => {
+  try {
+    const fullName = typeof req.body.fullName === 'string' ? req.body.fullName.trim() : '';
+    const password = typeof req.body.password === 'string' ? req.body.password : '';
+    const result = await pool.query(
+      'SELECT id, full_name, password_hash FROM managers WHERE lower(full_name) = lower($1)',
+      [fullName],
+    );
+    const manager = result.rows[0] ? new Manager({
+      id: result.rows[0].id,
+      fullName: result.rows[0].full_name,
+      passwordHash: result.rows[0].password_hash,
+    }) : null;
+    if (!manager || !(await bcrypt.compare(password, manager.passwordHash))) {
+      return res.redirect(303, '/manager/login?error=1');
+    }
+    req.session.regenerate(async (error) => {
+      if (error) return next(error);
+      try {
+        req.session.managerId = manager.id;
+        req.session.managerName = manager.fullName;
+        req.session.csrfToken = crypto.randomBytes(32).toString('hex');
+        await pool.query(
+          `INSERT INTO manager_logins (manager_id, session_id) VALUES ($1, $2)
+           ON CONFLICT (manager_id) DO UPDATE SET session_id = EXCLUDED.session_id, updated_at = NOW()`,
+          [manager.id, req.sessionID],
+        );
+        req.session.save((saveError) => {
+          if (saveError) return next(saveError);
+          res.redirect(303, '/manager');
+        });
+      } catch (loginError) {
+        next(loginError);
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/manager/logout', requireManager, requireCsrf, async (req, res, next) => {
+  try {
+    await pool.query('DELETE FROM manager_logins WHERE manager_id = $1 AND session_id = $2', [
+      req.session.managerId,
+      req.sessionID,
+    ]);
+    req.session.destroy((error) => {
+      if (error) return next(error);
+      res.clearCookie('classteachweb.sid');
+      res.redirect(303, '/manager/login');
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/manager', requireManager, async (req, res) => {
+  const token = csrfTokenFor(req);
+  const [teachersResult, studentsResult, subjectsResult, enrollmentsResult] = await Promise.all([
+    pool.query('SELECT id, full_name FROM teachers ORDER BY lower(full_name)'),
+    pool.query('SELECT id, full_name, email FROM students ORDER BY lower(full_name)'),
+    pool.query(
+      `SELECT sb.id, sb.name, sb.teacher_id, t.full_name AS teacher_name
+       FROM subjects sb JOIN teachers t ON t.id = sb.teacher_id
+       ORDER BY lower(sb.name), lower(t.full_name)`,
+    ),
+    pool.query(
+      `SELECT ss.subject_id, st.id AS student_id, st.full_name, st.email
+       FROM subject_students ss JOIN students st ON st.id = ss.student_id
+       ORDER BY lower(st.full_name)`,
+    ),
+  ]);
+  const enrollmentsBySubject = new Map();
+  for (const enrollment of enrollmentsResult.rows) {
+    const subjectId = String(enrollment.subject_id);
+    if (!enrollmentsBySubject.has(subjectId)) enrollmentsBySubject.set(subjectId, []);
+    enrollmentsBySubject.get(subjectId).push(enrollment);
+  }
+
+  const teacherOptions = teachersResult.rows.map((teacher) =>
+    `<option value="${teacher.id}">${escapeHtml(teacher.full_name)}</option>`).join('');
+  const subjectCards = subjectsResult.rows.map((subject) => {
+    const subjectId = String(subject.id);
+    const enrolled = enrollmentsBySubject.get(subjectId) || [];
+    const enrolledIds = new Set(enrolled.map((student) => String(student.student_id)));
+    const availableStudents = studentsResult.rows.filter((student) => !enrolledIds.has(String(student.id)));
+    const enrollmentList = enrolled.length
+      ? `<ul>${enrolled.map((student) => `<li>${escapeHtml(student.full_name)} <span class="muted">${escapeHtml(student.email)}</span></li>`).join('')}</ul>`
+      : '<p>No students enrolled.</p>';
+    const enrollmentForm = availableStudents.length
+      ? `<form method="post" action="/manager/subjects/${subject.id}/enrollments">${formCsrf(token)}
+          <label for="students-${subject.id}">Add students</label>
+          <select id="students-${subject.id}" name="studentIds" multiple size="5">
+            ${availableStudents.map((student) => `<option value="${student.id}">${escapeHtml(student.full_name)} (${escapeHtml(student.email)})</option>`).join('')}
+          </select><button type="submit">Enroll selected students</button></form>`
+      : '<p>All students are already enrolled.</p>';
+
+    return `<article><h3>${escapeHtml(subject.name)}</h3>
+      <p>Currently assigned to ${escapeHtml(subject.teacher_name)}.</p>
+      <form method="post" action="/manager/subjects/${subject.id}/teacher">${formCsrf(token)}
+        <label for="teacher-${subject.id}">Assign teacher</label>
+        <select id="teacher-${subject.id}" name="teacherId" required>
+          ${teachersResult.rows.map((teacher) => `<option value="${teacher.id}"${String(teacher.id) === String(subject.teacher_id) ? ' selected' : ''}>${escapeHtml(teacher.full_name)}</option>`).join('')}
+        </select><button type="submit">Save teacher</button></form>
+      <h4>Enrolled students</h4>${enrollmentList}${enrollmentForm}</article>`;
+  }).join('');
+
+  const content = `${managerNavigation(req.session.managerName, token)}
+    <h1>Management dashboard</h1>
+    <p>Create accounts and subjects, assign teachers, and enroll students. Reassigning a subject changes which teacher can manage it.</p>
+    <section><h2>Add a teacher</h2>
+      <form method="post" action="/manager/teachers">${formCsrf(token)}
+        <label for="teacherName">Full name</label><input id="teacherName" name="fullName" maxlength="120" required>
+        <label for="teacherPassword">Initial password (at least 12 characters)</label>
+        <input id="teacherPassword" name="password" type="password" minlength="12" maxlength="72" autocomplete="new-password" required>
+        <button type="submit">Add teacher</button></form>
+      <h3>Current teachers</h3>${teachersResult.rows.length
+    ? `<ul>${teachersResult.rows.map((teacher) => `<li>${escapeHtml(teacher.full_name)}</li>`).join('')}</ul>`
+    : '<p>No teachers yet.</p>'}</section>
+    <section><h2>Add a student</h2>
+      <form method="post" action="/manager/students">${formCsrf(token)}
+        <label for="studentName">Full name</label><input id="studentName" name="fullName" maxlength="120" required>
+        <label for="studentEmail">Email address</label><input id="studentEmail" name="email" type="email" maxlength="254" required>
+        <button type="submit">Add student</button></form>
+      <h3>Current students</h3>${studentsResult.rows.length
+    ? `<ul>${studentsResult.rows.map((student) => `<li>${escapeHtml(student.full_name)} <span class="muted">${escapeHtml(student.email)}</span></li>`).join('')}</ul>`
+    : '<p>No students yet.</p>'}</section>
+    <section><h2>Add a subject</h2>
+      ${teachersResult.rows.length
+    ? `<form method="post" action="/manager/subjects">${formCsrf(token)}
+        <label for="subjectName">Subject name</label><input id="subjectName" name="name" maxlength="100" required>
+        <label for="subjectTeacher">Assign teacher</label><select id="subjectTeacher" name="teacherId" required>${teacherOptions}</select>
+        <label for="latitude">Classroom latitude (optional)</label><input id="latitude" name="latitude" type="number" step="any" min="-90" max="90">
+        <label for="longitude">Classroom longitude (optional)</label><input id="longitude" name="longitude" type="number" step="any" min="-180" max="180">
+        <label for="radius">Geofence radius (meters)</label><input id="radius" name="radius" type="number" min="10" max="5000" value="100" required>
+        <button type="submit">Create subject</button></form>`
+    : '<p>Add a teacher before creating a subject.</p>'}</section>
+    <section><h2>Subjects and connections</h2>${subjectCards || '<p>No subjects yet.</p>'}</section>`;
+  res.send(renderPage('Management dashboard', content, token));
+});
+
+app.post('/manager/teachers', requireManager, requireCsrf, async (req, res) => {
+  let fullName;
+  let password;
+  try {
+    fullName = Teacher.validateName(req.body.fullName);
+    password = validateAccountPassword(req.body.password);
+  } catch (error) {
+    return res.status(400).send(escapeHtml(error.message));
+  }
+  const duplicate = await pool.query(
+    'SELECT 1 FROM teachers WHERE lower(full_name) = lower($1)',
+    [fullName],
+  );
+  if (duplicate.rowCount) return res.status(409).send('A teacher with that name already exists.');
+  const passwordHash = await bcrypt.hash(password, 12);
+  await pool.query(
+    'INSERT INTO teachers (full_name, password_hash) VALUES ($1, $2)',
+    [fullName, passwordHash],
+  );
+  res.redirect(303, '/manager');
+});
+
+app.post('/manager/students', requireManager, requireCsrf, async (req, res) => {
+  let fullName;
+  let email;
+  try {
+    fullName = Student.validateName(req.body.fullName);
+    email = Student.validateEmail(req.body.email).toLocaleLowerCase('en');
+  } catch (error) {
+    return res.status(400).send(escapeHtml(error.message));
+  }
+  const duplicate = await pool.query(
+    'SELECT 1 FROM students WHERE lower(email) = lower($1)',
+    [email],
+  );
+  if (duplicate.rowCount) return res.status(409).send('A student with that email address already exists.');
+  await pool.query('INSERT INTO students (full_name, email) VALUES ($1, $2)', [fullName, email]);
+  res.redirect(303, '/manager');
+});
+
+app.post('/manager/subjects', requireManager, requireCsrf, async (req, res) => {
+  let name;
+  let radius;
+  try {
+    name = Subject.validateName(req.body.name);
+    radius = Subject.validateRadius(req.body.radius);
+  } catch (error) {
+    return res.status(400).send(escapeHtml(error.message));
+  }
+  const teacherId = String(req.body.teacherId ?? '');
+  if (!validId(teacherId)) return res.status(400).send('Choose a valid teacher.');
+  const teacher = await pool.query('SELECT 1 FROM teachers WHERE id = $1', [teacherId]);
+  if (!teacher.rowCount) return res.status(400).send('Choose an existing teacher.');
+
+  const latitude = req.body.latitude === '' ? null : Number(req.body.latitude);
+  const longitude = req.body.longitude === '' ? null : Number(req.body.longitude);
+  if ((latitude === null) !== (longitude === null)
+    || (latitude !== null && (!Number.isFinite(latitude) || latitude < -90 || latitude > 90))
+    || (longitude !== null && (!Number.isFinite(longitude) || longitude < -180 || longitude > 180))) {
+    return res.status(400).send('Enter both valid classroom coordinates, or leave both blank.');
+  }
+  const duplicate = await pool.query(
+    'SELECT 1 FROM subjects WHERE teacher_id = $1 AND lower(name) = lower($2)',
+    [teacherId, name],
+  );
+  if (duplicate.rowCount) return res.status(409).send('That teacher already has a subject with this name.');
+  await pool.query(
+    `INSERT INTO subjects (teacher_id, name, classroom_latitude, classroom_longitude, geofence_radius_meters)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [teacherId, name, latitude, longitude, radius],
+  );
+  res.redirect(303, '/manager');
+});
+
+app.post('/manager/subjects/:subjectId/teacher', requireManager, requireCsrf, async (req, res) => {
+  const subjectId = String(req.params.subjectId);
+  const teacherId = String(req.body.teacherId ?? '');
+  if (!validId(subjectId)) return res.status(404).send('Subject not found.');
+  if (!validId(teacherId)) return res.status(400).send('Choose a valid teacher.');
+  const [subject, teacher] = await Promise.all([
+    pool.query('SELECT id, name FROM subjects WHERE id = $1', [subjectId]),
+    pool.query('SELECT 1 FROM teachers WHERE id = $1', [teacherId]),
+  ]);
+  if (!subject.rowCount) return res.status(404).send('Subject not found.');
+  if (!teacher.rowCount) return res.status(400).send('Choose an existing teacher.');
+  const duplicate = await pool.query(
+    'SELECT 1 FROM subjects WHERE teacher_id = $1 AND lower(name) = lower($2) AND id <> $3',
+    [teacherId, subject.rows[0].name, subjectId],
+  );
+  if (duplicate.rowCount) return res.status(409).send('That teacher already has a subject with this name.');
+  await pool.query('UPDATE subjects SET teacher_id = $1 WHERE id = $2', [teacherId, subjectId]);
+  res.redirect(303, '/manager');
+});
+
+app.post('/manager/subjects/:subjectId/enrollments', requireManager, requireCsrf, async (req, res) => {
+  const subjectId = String(req.params.subjectId);
+  if (!validId(subjectId)) return res.status(404).send('Subject not found.');
+  const subject = await pool.query('SELECT 1 FROM subjects WHERE id = $1', [subjectId]);
+  if (!subject.rowCount) return res.status(404).send('Subject not found.');
+
+  const submittedIds = values(req.body.studentIds).map(String);
+  if (submittedIds.some((studentId) => !validId(studentId))) {
+    return res.status(400).send('Choose valid students.');
+  }
+  const studentIds = [...new Set(submittedIds)];
+  if (studentIds.length) {
+    const students = await pool.query(
+      'SELECT id FROM students WHERE id = ANY($1::bigint[])',
+      [studentIds],
+    );
+    if (students.rowCount !== studentIds.length) return res.status(400).send('One or more students no longer exist.');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const studentId of studentIds) {
+        await client.query(
+          'INSERT INTO subject_students (subject_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [subjectId, studentId],
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+  res.redirect(303, '/manager');
 });
 
 app.get('/login', (req, res) => {

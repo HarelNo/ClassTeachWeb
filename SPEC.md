@@ -2,7 +2,7 @@
 
 **Status:** Implementation baseline for the classroom demo  
 **Deployment target:** Render Web Service with Render PostgreSQL  
-**Primary users:** Teachers and students  
+**Primary users:** Managers, teachers, and students
 **Source assignment:** Introduction to Software Engineering, Ex2: Vibe Coding & Deep Designing: Web-based Teaching Tool
 
 ## 1. Purpose and problem statement
@@ -70,10 +70,11 @@ The classroom radius, acceptable GPS accuracy, policy for missed checks, and ret
 
 | Role | Capabilities |
 |---|---|
-| Teacher | Manage own subjects and sessions, display/revoke session QR codes, view and export attendance, manage polls and discussion, provide class material, and review AI outputs. |
+| Manager | Create teacher and student accounts and subjects, assign teachers to subjects, and enroll students in subjects. Managers cannot access teacher-only class operations unless they also sign in as a teacher. |
+| Teacher | Manage assigned subjects and sessions, display/revoke session QR codes, view and export attendance, manage polls and discussion, provide class material, and review AI outputs. |
 | Student | Join a session for which they are rostered, submit location check-ins, participate in polls/discussion, and access permitted class summaries and their own homework feedback. |
 
-Teachers must only access their own classes. Students must only access classes and submissions they are entitled to see. The demo uses roster selection, clearly marked as demo-only and not strong authentication. A stronger verification method is required before production use.
+Managers, teachers, and students use separate authentication records and protected routes. Teachers must only access their assigned classes. Students must only access classes and submissions they are entitled to see. The demo uses roster selection, clearly marked as demo-only and not strong authentication. A stronger student verification method is required before production use.
 
 ## 5. Software requirements specification (SRS)
 
@@ -81,7 +82,11 @@ Teachers must only access their own classes. Students must only access classes a
 
 #### Accounts, rosters, and subjects
 
-- **FR-01:** The system shall store teacher accounts with password hashes, never plaintext passwords.
+- **FR-01:** The system shall store manager and teacher account passwords as hashes, never plaintext passwords.
+- **FR-01a:** The system shall provide separate manager and teacher authentication and shall not permit public manager self-registration.
+- **FR-01b:** A manager shall be able to create teacher accounts and student roster entries in the application.
+- **FR-01c:** A manager shall be able to create subjects, assign a teacher to each subject, and enroll students in subjects.
+- **FR-01d:** A manager shall be able to reassign a subject to a different teacher. Reassignment shall change which teacher can manage that subject.
 - **FR-02:** A teacher shall be able to manage one or more subjects/classes.
 - **FR-03:** The system shall associate students with classes using a roster containing only the fields needed for class operation.
 - **FR-04:** The system shall prevent a teacher from accessing another teacher's class data.
@@ -154,7 +159,7 @@ Teachers must only access their own classes. Students must only access classes a
 |---|---|
 | Mobile-friendly web UI | Teacher dashboard, student join/check-in, attendance, polls, questions, summaries, and submissions. |
 | Express application/API | Authentication, authorization, session management, validation, feature routes, and response formatting. |
-| PostgreSQL | Teachers, students, subjects, memberships, class sessions, attendance events, polls, discussion, assignments, submissions, and persistent web sessions. |
+| PostgreSQL | Managers, teachers, students, subjects, teacher assignments, student memberships, class sessions, attendance events, polls, discussion, assignments, submissions, and persistent web sessions. |
 | QR/session service | Creates scoped random session tokens, renders QR images, and expires/revokes links. |
 | Attendance/location service | Validates check-in ownership, timestamps events, evaluates configurable geofence rules, and exports CSV. |
 | OpenAI adapter | Generates transcript summaries and homework feedback after teacher confirmation; model is configurable, while text similarity is calculated locally. |

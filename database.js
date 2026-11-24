@@ -20,6 +20,15 @@ async function initializeDatabase() {
     CREATE UNIQUE INDEX IF NOT EXISTS teachers_full_name_lower_idx
       ON teachers (lower(full_name));
 
+    CREATE TABLE IF NOT EXISTS managers (
+      id BIGSERIAL PRIMARY KEY,
+      full_name TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS managers_full_name_lower_idx
+      ON managers (lower(full_name));
+
     CREATE TABLE IF NOT EXISTS students (
       id BIGSERIAL PRIMARY KEY,
       full_name TEXT NOT NULL,
@@ -31,6 +40,12 @@ async function initializeDatabase() {
 
     CREATE TABLE IF NOT EXISTS teacher_logins (
       teacher_id BIGINT PRIMARY KEY REFERENCES teachers(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL UNIQUE,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS manager_logins (
+      manager_id BIGINT PRIMARY KEY REFERENCES managers(id) ON DELETE CASCADE,
       session_id TEXT NOT NULL UNIQUE,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );

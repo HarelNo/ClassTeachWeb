@@ -6,6 +6,8 @@ requirements, architecture, phased scope, and test strategy are in [SPEC.md](./S
 ## Features
 
 - Teacher sign-in, subject creation, roster enrollment, and QR-based class sessions.
+- Management sign-in for creating teacher and student accounts, creating subjects,
+  assigning teachers, and enrolling students.
 - Student roster selection and GPS geofence check-ins every 10 minutes while the
   student page is open and active. Check-in status and accuracy are saved
   automatically to PostgreSQL; raw GPS coordinates are evaluated but not retained.
@@ -40,6 +42,25 @@ npm start
 
 The service listens on port `3000` by default (`PORT` can override it).
 `/health` checks application-to-database connectivity.
+
+## Management account
+
+The first management account is bootstrapped from a terminal; management accounts
+cannot be created through public self-registration. Set `DATABASE_URL` in the
+local `.env` to the Render database's **External Database URL**, then run:
+
+```powershell
+$env:NODE_ENV = 'production'
+npm run create:manager -- "Class Manager"
+Remove-Item Env:\NODE_ENV
+```
+
+The command prompts for the manager password without echoing it. Use a password
+of at least 12 characters. Running it again with the same full name resets that
+manager's password and invalidates their existing sessions. Open `/manager/login`
+to sign in. Managers can add teachers, students, and subjects, assign teachers
+to subjects, and enroll students. Teacher login uses the teacher's full name and
+the password set by the manager.
 
 ## Load teacher and student rosters
 
