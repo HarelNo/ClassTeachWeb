@@ -6,6 +6,9 @@
   const lastCheckinKey = `classteachweb-last-checkin-${liveSession}-${studentId}`;
   const openDetailsKey = `classteachweb-open-details-${liveSession}-${studentId}`;
   const checkinStatus = document.getElementById('checkin-status');
+  const configuredMaxAccuracy = Number(document.body.dataset.gpsMaxAccuracyMeters);
+  const maximumAccuracyMeters = Number.isFinite(configuredMaxAccuracy) && configuredMaxAccuracy > 0
+    ? configuredMaxAccuracy : 100;
   let checkinInFlight = false;
   let checkinRequestPollInFlight = false;
   let pendingGpsRequestId = null;
@@ -230,10 +233,17 @@
       payload.requestId = pulseId;
       try {
         const result = await send('/student/checkin', payload);
-        const accuracy = result.accuracyMeters === null
-          ? result.detail ? ` — ${result.detail.replaceAll('-', ' ')}` : ''
+        const accuracy = result.accuracyMeters === null ? ''
           : ` — GPS accuracy ${result.accuracyMeters} m`;
-        checkinStatus.textContent = `${result.status}${accuracy} — checked at ${result.recordedAt}`;
+        const detailMessages = {
+          'accuracy-too-low': `Accuracy is too low. Enable precise location; this check requires ${Math.round(maximumAccuracyMeters)} m or better.`,
+          'permission-denied': 'Allow location access in your browser and device settings.',
+          timeout: 'Location request timed out. Try again near a window or outdoors.',
+          unavailable: 'The browser could not determine a location.',
+          'location-or-accuracy-unavailable': 'The browser could not determine a reliable location.',
+        };
+        const detail = result.detail ? ` — ${detailMessages[result.detail] || result.detail.replaceAll('-', ' ')}` : '';
+        checkinStatus.textContent = `${result.status}${accuracy}${detail} — checked at ${result.recordedAt}`;
         if (sessionStorageAvailable) rememberCheckin();
       } catch (error) {
         checkinStatus.textContent = error.message;
@@ -245,18 +255,55 @@
       await saveStatus({ reason: 'unavailable' });
       return;
     }
-    navigator.geolocation.getCurrentPosition((position) => {
+    let bestPosition = null;
+    let watchId = null;
+    let acquisitionTimeout = null;
+    let locationResolved = false;
+    const stopWatching = () => {
+      if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+      if (acquisitionTimeout !== null) window.clearTimeout(acquisitionTimeout);
+    };
+    const submitPosition = (position) => {
+      if (locationResolved) return;
+      locationResolved = true;
+      stopWatching();
       saveStatus({
         latitude: position.coords.latitude,
         longitude: position.coords.longitude,
         accuracyMeters: position.coords.accuracy,
       });
-    }, async (error) => {
+    };
+    const submitLocationError = (error) => {
+      if (locationResolved) return;
+      locationResolved = true;
+      stopWatching();
       const reason = error.code === error.PERMISSION_DENIED
         ? 'permission-denied'
         : error.code === error.TIMEOUT ? 'timeout' : 'unavailable';
-      await saveStatus({ reason });
-    }, { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+      saveStatus({ reason });
+    };
+    try {
+      watchId = navigator.geolocation.watchPosition((position) => {
+        if (locationResolved) return;
+        if (!bestPosition || position.coords.accuracy < bestPosition.coords.accuracy) {
+          bestPosition = position;
+        }
+        if (position.coords.accuracy <= maximumAccuracyMeters) {
+          submitPosition(position);
+        } else {
+          checkinStatus.textContent = `Waiting for a more accurate GPS fix — current accuracy ${Math.round(position.coords.accuracy)} m; target ${Math.round(maximumAccuracyMeters)} m or better.`;
+        }
+      }, (error) => {
+        if (bestPosition && error.code !== error.PERMISSION_DENIED) submitPosition(bestPosition);
+        else submitLocationError(error);
+      }, { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 });
+      acquisitionTimeout = window.setTimeout(() => {
+        if (bestPosition) submitPosition(bestPosition);
+        else submitLocationError({ code: 3, TIMEOUT: 3 });
+      }, 30000);
+    } catch (error) {
+      await saveStatus({ reason: 'unavailable' });
+    }
   }
 
   async function checkForTeacherGpsRequest() {

@@ -30,6 +30,7 @@ test('geofence evaluates distance and rejects unreliable or missing GPS', () => 
   assert.equal(evaluateLocation(subject, 32.0853, 34.7818, 8).status, 'inside');
   assert.equal(evaluateLocation(subject, 32.09, 34.7818, 8).status, 'outside');
   assert.equal(evaluateLocation(subject, 32.0853, 34.7818, 101).status, 'unavailable');
+  assert.equal(evaluateLocation(subject, 32.0853, 34.7818, 2000).status, 'unavailable');
   assert.equal(evaluateLocation(subject, NaN, 34.7818, 8).status, 'unavailable');
   assert.equal(evaluateLocation(new Subject({ name: 'No room' }), 0, 0, 8).status, 'unavailable');
 });

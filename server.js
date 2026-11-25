@@ -112,13 +112,24 @@ function renderPage(title, content, csrfToken = '', liveSessionId = '', checkins
       .grid { display: grid; gap: .75rem; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); }
       .actions { display: flex; flex-wrap: wrap; gap: .35rem; }
       .inline { display: inline-block; }
+      .classroom-location-map { border: 1px solid #dce2ed; height: 24rem; margin: .5rem 0; width: 100%; }
       [role=status], [role=alert] { min-height: 1.5em; }
     </style>
   </head>
-  <body data-live-session="${escapeHtml(liveSessionId)}" data-student-id="${escapeHtml(studentId)}" data-checkins-enabled="${checkinsEnabled}">
-    <main>${content}</main><script src="/student.js" defer></script><script src="/live-chat.js" defer></script>
+  <body data-live-session="${escapeHtml(liveSessionId)}" data-student-id="${escapeHtml(studentId)}" data-checkins-enabled="${checkinsEnabled}" data-gps-max-accuracy-meters="${maximumAccuracyMeters}" data-google-maps-api-key="${escapeHtml(process.env.GOOGLE_MAPS_API_KEY || '')}">
+    <main>${content}</main><script src="/student.js" defer></script><script src="/live-chat.js" defer></script><script src="/location-picker.js" defer></script>
   </body>
 </html>`;
+}
+
+function classroomLocationPicker() {
+  return `<div data-location-picker>
+    <p class="muted">Set the classroom point using accurate GPS or click its exact location on the map.</p>
+    <button type="button" data-use-current-location>Use my current GPS location</button>
+    <p data-location-status role="status"></p>
+    <div class="classroom-location-map" data-classroom-map aria-label="Select classroom location on Google Maps"></div>
+    <p class="muted" data-map-status role="status"></p>
+  </div>`;
 }
 
 function csrfTokenFor(req) {
@@ -445,6 +456,7 @@ async function subjectPage(req, res, subject) {
       <form method="post" action="/teacher/subjects/${subject.id}/location">${formCsrf(token)}
         <label for="latitude">Latitude</label><input id="latitude" name="latitude" type="number" step="any" min="-90" max="90" value="${escapeHtml(subject.classroom_latitude ?? '')}">
         <label for="longitude">Longitude</label><input id="longitude" name="longitude" type="number" step="any" min="-180" max="180" value="${escapeHtml(subject.classroom_longitude ?? '')}">
+        ${classroomLocationPicker()}
         <label for="radius">Geofence radius (meters)</label><input id="radius" name="radius" type="number" min="10" max="5000" value="${subject.geofence_radius_meters}" required>
         <button>Save classroom location</button></form>
       <p class="muted">GPS is checked in the student browser while the page is active. A browser cannot read the router MAC address.</p>
@@ -645,6 +657,7 @@ app.get('/manager', requireManager, async (req, res) => {
         <label for="subjectTeacher">Assign teacher</label><select id="subjectTeacher" name="teacherId" required>${teacherOptions}</select>
         <label for="latitude">Classroom latitude (optional)</label><input id="latitude" name="latitude" type="number" step="any" min="-90" max="90">
         <label for="longitude">Classroom longitude (optional)</label><input id="longitude" name="longitude" type="number" step="any" min="-180" max="180">
+        ${classroomLocationPicker()}
         <label for="radius">Geofence radius (meters)</label><input id="radius" name="radius" type="number" min="10" max="5000" value="100" required>
         <button type="submit">Create subject</button></form>`
     : '<p>Add a teacher before creating a subject.</p>'}</section>
@@ -862,6 +875,7 @@ app.get('/teacher', requireTeacher, async (req, res) => {
       <label for="name">Subject name</label><input id="name" name="name" maxlength="100" required>
       <label for="latitude">Classroom latitude (optional)</label><input id="latitude" name="latitude" type="number" step="any" min="-90" max="90">
       <label for="longitude">Classroom longitude (optional)</label><input id="longitude" name="longitude" type="number" step="any" min="-180" max="180">
+      ${classroomLocationPicker()}
       <label for="radius">Geofence radius (meters)</label><input id="radius" name="radius" type="number" min="10" max="5000" value="100" required>
       <button>Create subject</button></form>
     <section><h2>Manage subjects</h2>${subjects.rows.length ? `<ul>${subjects.rows.map((subject) =>
@@ -1596,7 +1610,7 @@ app.get('/student/live', async (req, res) => {
       <p id="checkin-status" role="status">${latestAttendance
     ? `Last saved status: ${escapeHtml(latestAttendance.status)}${latestAttendance.accuracy_meters ? ` — GPS accuracy ${Math.round(latestAttendance.accuracy_meters)} m` : latestAttendance.detail ? ` — ${escapeHtml(latestAttendance.detail.replaceAll('-', ' '))}` : ''} at ${escapeHtml(new Date(latestAttendance.recorded_at).toLocaleString())}`
     : 'Waiting for first GPS check-in.'}</p>
-      ${!context.ended_at ? '<button id="check-location" type="button">Check location now</button><p class="muted">Allow location access. GPS is checked automatically while this live page is open and active.</p>' : ''}
+      ${!context.ended_at ? `<button id="check-location" type="button">Check location now</button><p class="muted">Checks run now and every 10 minutes while this page is open and active. Allow precise location; accuracy must be ${maximumAccuracyMeters} m or better. The browser waits up to 30 seconds for a better reading. If accuracy stays near 2,000 m, enable precise location in your device/browser settings or try a phone with GPS.</p>` : ''}
     </section>
     <section><h2>Live class chat</h2>
       <p>Messages are visible to the class and saved to the database.</p>
@@ -1686,7 +1700,7 @@ app.get('/student', async (req, res) => {
     ? `Last saved status: ${escapeHtml(latest.status)}${latest.accuracy_meters ? ` — GPS accuracy ${Math.round(latest.accuracy_meters)} m` : latest.detail ? ` — ${escapeHtml(latest.detail.replaceAll('-', ' '))}` : ''} at ${escapeHtml(new Date(latest.recorded_at).toLocaleString())}`
     : 'Waiting for first GPS check-in.'}</p>
       ${!context.ended_at ? '<button id="check-location" type="button">Check location now</button>' : ''}
-      <p class="muted">With permission, GPS is checked now and every 10 minutes while this page is open and active. Browser GPS may be inaccurate or unavailable.</p>
+      <p class="muted">Checks run now and every 10 minutes while this page is open and active. Allow precise location; accuracy must be ${maximumAccuracyMeters} m or better. The browser waits up to 30 seconds for a better reading. If accuracy stays near 2,000 m, enable precise location in your device/browser settings or try a phone with GPS.</p>
     </section>
     <section><h2>Class summaries</h2>${summaries.rows.length
     ? summaries.rows.map((row) => `<article><p><strong>Teacher-approved AI-generated summary</strong></p>${escapeHtml(row.summary)}</article>`).join('')
@@ -1769,7 +1783,8 @@ app.post('/student/checkin', requireStudent, requireCsrf, async (req, res) => {
   const reason = ['permission-denied', 'timeout', 'unavailable'].includes(req.body.reason)
     ? req.body.reason : null;
   const detail = evaluation.status === 'unavailable'
-    ? reason || 'location-or-accuracy-unavailable' : null;
+    ? reason || (Number.isFinite(accuracy) && accuracy > maximumAccuracyMeters
+      ? 'accuracy-too-low' : 'location-or-accuracy-unavailable') : null;
   const client = await pool.connect();
   let recordedAt;
   let savedDetail;

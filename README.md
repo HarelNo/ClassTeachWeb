@@ -31,6 +31,9 @@ Students currently identify themselves by selecting their roster entry after
 scanning a QR code. This is demo-only identity verification, not proof of identity.
 The browser cannot read the classroom router's MAC address. The app uses GPS
 instead and cannot guarantee that browser location is accurate or unspoofed.
+Check-ins require reported accuracy within the configured limit (100 m by
+default); the browser waits up to 30 seconds for a better reading. If accuracy
+remains poor, enable precise location in the browser and device settings.
 
 ## Run locally
 
@@ -109,7 +112,12 @@ npm run import:rosters -- ./data/teachers.csv ./data/students.csv
 ```
 
 Sign in at `/login`, create a subject, enroll students from the roster, and set
-the classroom coordinates/radius before starting a session. The teacher page
+the classroom coordinates/radius before starting a session. Teachers can fill
+the classroom point using accurate browser GPS or click the point on the embedded
+Google Map. Set `GOOGLE_MAPS_API_KEY` in Render to enable the map picker; enable
+the Maps JavaScript API, enable Google Maps billing, and restrict the key to your
+site's HTTP referrer and that API. GPS and manual coordinate entry work without
+a Google key. The teacher page
 shows the QR code. Students scan it, select their roster entry, and allow
 location access. Keep the student page open and active for periodic checks;
 mobile browsers may throttle background pages.
@@ -136,6 +144,9 @@ It configures the Node.js web service and Render PostgreSQL. Render supplies
 `DATABASE_URL` and `SESSION_SECRET`; set `OPENAI_API_KEY` in the Render dashboard
 only if you want to enable AI features. The app must use HTTPS in deployment for
 secure session cookies and browser geolocation.
+To enable the classroom map picker, also set `GOOGLE_MAPS_API_KEY` to a key
+with billing and the Maps JavaScript API enabled, restricted to your Render
+site's HTTP referrer and that API.
 
 The Blueprint uses Render's free PostgreSQL plan for testing. It has a 1 GB limit
 and expires 30 days after creation. Render provides a 14-day grace period to

@@ -62,7 +62,9 @@ Some native Android apps may be able to read the connected access point's BSSID 
 The feasible design for the demo is:
 
 - Use the browser Geolocation API with the student's explicit permission.
+- Wait up to 30 seconds for the browser to provide a location at or below the configured accuracy limit, submitting the best available reading if it does not improve in time.
 - Check the reported coordinates against a teacher-configured classroom point and radius on the server.
+- Let teachers set the classroom point from an accurate browser GPS reading or by clicking a point on Google Maps. The map picker requires a referrer-restricted Google Maps API key; GPS and direct coordinate entry remain available without one.
 - Request a new check every 10 minutes while the student page is open and in the foreground. Mobile browsers may throttle or suspend background pages.
 - Label location evidence as **inside**, **outside**, **stale**, or **unavailable**; do not describe it as tamper-proof. GPS can be inaccurate or spoofed.
 - Evaluate coordinates on the server but do not retain raw coordinates; save only the evaluated status, reported accuracy, server timestamp, and an unavailable reason where relevant.
