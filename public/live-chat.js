@@ -1,5 +1,17 @@
+function chatUrlForPath(pathname) {
+  const teacherLivePage = pathname.match(/^\/teacher\/sessions\/(\d+)\/live\/?$/);
+  if (teacherLivePage) return `/teacher/sessions/${teacherLivePage[1]}/chat`;
+  if (/^\/student\/live\/?$/.test(pathname)) return '/student/live/chat';
+  return null;
+}
+
+if (typeof module !== 'undefined') module.exports = { chatUrlForPath };
+
 (() => {
+  if (typeof document === 'undefined' || typeof window === 'undefined') return;
+
   const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content;
+  const chatUrl = chatUrlForPath(window.location.pathname);
 
   document.querySelectorAll('[data-live-chat]').forEach((chat) => {
     const list = chat.querySelector('[data-chat-messages]');
@@ -8,6 +20,13 @@
     const sendButton = form?.querySelector('button[type="submit"]');
     const status = form?.querySelector('[data-chat-status]');
     if (!list || !form || !input || !sendButton || !status) return;
+
+    if (!chatUrl) {
+      status.textContent = 'Could not identify this live class. Reload the live class page and try again.';
+      input.disabled = true;
+      sendButton.disabled = true;
+      return;
+    }
 
     let lastId = chat.dataset.nextId || '0';
     let stopped = chat.dataset.chatActive !== 'true';
@@ -54,7 +73,7 @@
       if (stopped || requestInFlight || document.visibilityState !== 'visible') return;
       requestInFlight = true;
       try {
-        const url = new URL(chat.dataset.messagesUrl, window.location.origin);
+        const url = new URL(chatUrl, window.location.origin);
         url.searchParams.set('after', lastId);
         const response = await fetch(url, { credentials: 'same-origin' });
         const result = await response.json().catch(() => ({}));
@@ -83,7 +102,7 @@
       sendButton.disabled = true;
       status.textContent = 'Sending…';
       try {
-        const response = await fetch(chat.dataset.sendUrl, {
+        const response = await fetch(chatUrl, {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
