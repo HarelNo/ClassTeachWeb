@@ -146,6 +146,23 @@ async function initializeDatabase() {
       UNIQUE (student_id, dedupe_key)
     );
 
+    CREATE TABLE IF NOT EXISTS live_chat_messages (
+      id BIGSERIAL PRIMARY KEY,
+      session_id BIGINT NOT NULL REFERENCES teaching_sessions(id) ON DELETE CASCADE,
+      author_type TEXT NOT NULL CHECK (author_type IN ('teacher', 'student')),
+      teacher_id BIGINT REFERENCES teachers(id) ON DELETE SET NULL,
+      student_id BIGINT REFERENCES students(id) ON DELETE SET NULL,
+      author_name TEXT NOT NULL,
+      body TEXT NOT NULL CHECK (char_length(body) BETWEEN 1 AND 1000),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CHECK (
+        (author_type = 'teacher' AND student_id IS NULL)
+        OR (author_type = 'student' AND teacher_id IS NULL)
+      )
+    );
+    CREATE INDEX IF NOT EXISTS live_chat_messages_session_id_idx
+      ON live_chat_messages (session_id, id);
+
     CREATE TABLE IF NOT EXISTS class_summaries (
       id BIGSERIAL PRIMARY KEY,
       session_id BIGINT NOT NULL REFERENCES teaching_sessions(id) ON DELETE CASCADE,

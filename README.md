@@ -8,6 +8,8 @@ requirements, architecture, phased scope, and test strategy are in [SPEC.md](./S
 - Teacher sign-in, subject creation, roster enrollment, and QR-based class sessions.
 - Management sign-in for creating teacher and student accounts, creating subjects,
   assigning teachers, and enrolling students.
+- A collapsed QR-code panel and a separate live-class page for polls,
+  questions/suggestions, and a database-backed chat available during active sessions.
 - Student roster selection and GPS geofence check-ins every 10 minutes while the
   student page is open and active. Check-in status and accuracy are saved
   automatically to PostgreSQL; raw GPS coordinates are evaluated but not retained.
@@ -42,6 +44,19 @@ npm start
 
 The service listens on port `3000` by default (`PORT` can override it).
 `/health` checks application-to-database connectivity.
+
+## Live class participation
+
+Start a session from the teacher's subject page. The QR code stays hidden until
+you open **Show student QR code**; its link opens the student join page in a new
+tab. From the subject page, choose **Open live class tools** for live chat, polls,
+and questions/suggestions. Students scan the QR code, join, then choose **Open
+live class participation** from their class page. Chat messages are saved to
+PostgreSQL and appear for other participants within a few seconds. Chat, polls,
+and questions stop accepting new activity when the teacher ends the session.
+
+Teacher login and management login link to each other from their respective
+login pages.
 
 ## Management account
 

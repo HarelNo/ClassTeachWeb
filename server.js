@@ -14,6 +14,7 @@ const { Manager, Teacher, Student, Subject, evaluateLocation } = require('./mode
 const { generateText } = require('./services/openai');
 const { similarityDetails } = require('./similarity');
 const { attendanceStatus } = require('./attendance');
+const { validateChatMessage } = require('./live-chat');
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
@@ -100,6 +101,11 @@ function renderPage(title, content, csrfToken = '', liveSessionId = '', checkins
       table { border-collapse: collapse; display: block; max-width: 100%; overflow-x: auto; width: 100%; }
       th, td { border-bottom: 1px solid #dce2ed; padding: .5rem; text-align: left; vertical-align: top; }
       img { height: auto; max-width: 100%; }
+      details > summary { cursor: pointer; font-weight: 700; padding: .6rem 0; }
+      .chat-messages { background: #f5f7fb; border: 1px solid #dce2ed; border-radius: .5rem; max-height: 24rem; overflow-y: auto; padding: .5rem; }
+      .chat-message { background: white; border: 1px solid #dce2ed; border-radius: .5rem; margin: .5rem 0; padding: .25rem .75rem; }
+      .chat-message p { overflow-wrap: anywhere; white-space: pre-wrap; }
+      .chat-message time { color: #505b70; font-size: .85rem; margin-left: .5rem; }
       .muted { color: #505b70; }
       .status { font-weight: 700; }
       .notice { background: #fff7da; border-left: 4px solid #b77900; padding: .75rem; }
@@ -110,7 +116,7 @@ function renderPage(title, content, csrfToken = '', liveSessionId = '', checkins
     </style>
   </head>
   <body data-live-session="${escapeHtml(liveSessionId)}" data-student-id="${escapeHtml(studentId)}" data-checkins-enabled="${checkinsEnabled}">
-    <main>${content}</main><script src="/student.js" defer></script>
+    <main>${content}</main><script src="/student.js" defer></script><script src="/live-chat.js" defer></script>
   </body>
 </html>`;
 }
@@ -209,6 +215,26 @@ function managerNavigation(name, token) {
     <form class="inline" method="post" action="/manager/logout">${formCsrf(token)}<button type="submit">Log out</button></form></header>`;
 }
 
+function renderChat(messages, messagesUrl, sendUrl, disabled = false) {
+  const messageList = messages.length
+    ? messages.map((message) => `<article class="chat-message" data-message-id="${escapeHtml(message.id)}">
+        <p><strong>${escapeHtml(message.author_name)}</strong>
+          <time datetime="${escapeHtml(new Date(message.created_at).toISOString())}">${escapeHtml(new Date(message.created_at).toLocaleTimeString())}</time></p>
+        <p>${escapeHtml(message.body)}</p></article>`).join('')
+    : '<p class="muted" data-chat-empty>No messages yet. Start the conversation.</p>';
+  const latestId = messages.length ? messages[messages.length - 1].id : '0';
+  return `<div class="chat-panel" data-live-chat data-chat-active="${!disabled}" data-messages-url="${escapeHtml(messagesUrl)}"
+      data-next-id="${escapeHtml(latestId)}">
+    <div class="chat-messages" data-chat-messages role="log" aria-live="polite" aria-label="Live class chat">${messageList}</div>
+    <form data-chat-form data-send-url="${escapeHtml(sendUrl)}">
+      <label for="chat-message">Message to the class</label>
+      <textarea id="chat-message" name="body" maxlength="1000" required ${disabled ? 'disabled' : ''}></textarea>
+      <button type="submit" ${disabled ? 'disabled' : ''}>Send message</button>
+      <p data-chat-status role="status"></p>
+    </form>
+  </div>`;
+}
+
 function values(value) {
   return Array.isArray(value) ? value : value === undefined ? [] : [value];
 }
@@ -282,33 +308,10 @@ function renderAttendanceTable(rows, subjectSessionId, csrfToken) {
 
 async function subjectPage(req, res, subject) {
   const token = csrfTokenFor(req);
-  const [rosterResult, enrolledResult, sessionsResult, pollsResult, itemsResult,
-    assignmentsResult, summariesResult] = await Promise.all([
+  const [rosterResult, enrolledResult, sessionsResult, assignmentsResult, summariesResult] = await Promise.all([
     pool.query('SELECT id, full_name, email FROM students ORDER BY lower(full_name)'),
     pool.query('SELECT student_id FROM subject_students WHERE subject_id = $1', [subject.id]),
     pool.query('SELECT id, started_at, ended_at FROM teaching_sessions WHERE subject_id = $1 ORDER BY started_at DESC', [subject.id]),
-    pool.query(
-      `SELECT p.id, p.prompt, p.closed_at, p.session_id,
-         json_agg(json_build_object('label', option_counts.label, 'votes', option_counts.votes)
-           ORDER BY option_counts.id) AS results,
-         SUM(option_counts.votes)::int AS vote_count
-       FROM polls p
-       JOIN (
-         SELECT po.id, po.poll_id, po.label, COUNT(v.id)::int AS votes
-         FROM poll_options po LEFT JOIN poll_votes v ON v.option_id = po.id
-         GROUP BY po.id
-       ) option_counts ON option_counts.poll_id = p.id
-       JOIN teaching_sessions ts ON ts.id = p.session_id
-       WHERE ts.subject_id = $1 GROUP BY p.id ORDER BY p.created_at DESC LIMIT 20`,
-      [subject.id],
-    ),
-    pool.query(
-      `SELECT di.*, st.full_name AS student_name
-       FROM discussion_items di JOIN teaching_sessions ts ON ts.id = di.session_id
-       JOIN students st ON st.id = di.student_id
-       WHERE ts.subject_id = $1 ORDER BY di.created_at DESC LIMIT 100`,
-      [subject.id],
-    ),
     pool.query('SELECT * FROM assignments WHERE subject_id = $1 ORDER BY created_at DESC', [subject.id]),
     pool.query(
       `SELECT cs.*, ts.started_at FROM class_summaries cs
@@ -319,17 +322,23 @@ async function subjectPage(req, res, subject) {
   ]);
   const enrolled = new Set(enrolledResult.rows.map((row) => String(row.student_id)));
   const active = sessionsResult.rows.find((row) => !row.ended_at);
-  let qrContent = '<p>No active session. Start one to create a QR code.</p>';
+  let qrContent = '';
   const joinToken = req.session.qrTokens?.[String(subject.id)];
   if (active && joinToken) {
     const baseUrl = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || `${req.protocol}://${req.get('host')}`;
     const joinUrl = new URL(`/join/${joinToken}`, baseUrl).toString();
     const qr = await QRCode.toDataURL(joinUrl, { errorCorrectionLevel: 'M', margin: 2, width: 320 });
-    qrContent = `<p>Students scan this code to join <strong>${escapeHtml(subject.name)}</strong>.</p>
-      <img src="${qr}" alt="QR code for ${escapeHtml(subject.name)}">
-      <p>Join link: <a href="${escapeHtml(joinUrl)}">${escapeHtml(joinUrl)}</a></p>`;
+    qrContent = `<details><summary>Show student QR code</summary>
+      <p>Students scan this code to join <strong>${escapeHtml(subject.name)}</strong>.</p>
+      <a href="${escapeHtml(joinUrl)}" target="_blank" rel="noopener noreferrer">
+        <img src="${qr}" width="320" height="320" alt="Open student join page for ${escapeHtml(subject.name)} in a new tab">
+      </a>
+      <p>Join link: <a href="${escapeHtml(joinUrl)}" target="_blank" rel="noopener noreferrer">Open student join page in a new tab</a></p>
+    </details>`;
   } else if (active) {
     qrContent = '<p>The previous browser no longer has the QR link. Create a replacement code to continue.</p>';
+  } else {
+    qrContent = '<p>No active session. Start one to create a QR code.</p>';
   }
 
   const attendanceContent = sessionsResult.rows.length
@@ -346,17 +355,6 @@ async function subjectPage(req, res, subject) {
     ? rosterResult.rows.map((student) => `<label><input type="checkbox" name="studentIds" value="${student.id}" ${enrolled.has(String(student.id)) ? 'checked' : ''}>
         ${escapeHtml(student.full_name)} (${escapeHtml(student.email)})</label>`).join('')
     : '<p>Add students using the roster importer before enrolling them.</p>';
-  const polls = pollsResult.rows.map((poll) => `<li>${escapeHtml(poll.prompt)} — ${poll.vote_count} votes ${poll.closed_at ? '(closed)' : ''}
-    <ul>${(poll.results || []).map((result) => `<li>${escapeHtml(result.label)}: ${result.votes}</li>`).join('')}</ul>
-    ${!poll.closed_at ? `<form class="inline" method="post" action="/teacher/polls/${poll.id}/close">${formCsrf(token)}<button>Close poll</button></form>` : ''}</li>`).join('');
-  const discussions = itemsResult.rows.map((item) => `<article><p><strong>${escapeHtml(item.student_name)}</strong>
-    · ${escapeHtml(item.visibility)} · ${escapeHtml(new Date(item.created_at).toLocaleString())}</p>
-    <p>${escapeHtml(item.body)}</p>${item.teacher_reply ? `<p><strong>Teacher reply:</strong> ${escapeHtml(item.teacher_reply)}</p>` : ''}
-    <form method="post" action="/teacher/discussion/${item.id}">${formCsrf(token)}
-      <label for="reply-${item.id}">Teacher reply</label><textarea id="reply-${item.id}" name="reply" maxlength="3000">${escapeHtml(item.teacher_reply || '')}</textarea>
-      <button name="action" value="reply">Save reply</button>
-      ${item.visibility === 'class' ? '<button name="action" value="hide">Hide from class</button>' : ''}
-    </form></article>`).join('');
   const assignmentCards = await Promise.all(assignmentsResult.rows.map(async (assignment) => {
     const submissions = await pool.query(
       `SELECT s.id, s.content, s.submitted_at, st.full_name, sr.feedback, sr.status AS review_status, sr.similarity
@@ -411,17 +409,15 @@ async function subjectPage(req, res, subject) {
       </form>
       ${active ? `<form method="post" action="/teacher/sessions/${active.id}/end">${formCsrf(token)}<button>End class session</button></form>` : ''}
     </section>
+    <section><h2>Live class</h2>
+      ${active
+    ? `<p>Open the separate live page for class chat, polls, questions, and suggestions.</p>
+       <p><a href="/teacher/sessions/${active.id}/live">Open live class tools</a></p>`
+    : '<p>Start a class session to enable live participation tools.</p>'}
+    </section>
     <section><h2>Automatically saved attendance</h2>
       <p>Every accepted check-in and teacher correction is saved to PostgreSQL automatically. CSV is a convenience download only.</p>${attendanceContent}
     </section>
-    <section><h2>Quick polls</h2>
-      ${active ? `<form method="post" action="/teacher/sessions/${active.id}/polls">${formCsrf(token)}
-        <label for="poll-prompt">Question</label><input id="poll-prompt" name="prompt" maxlength="500" required>
-        <label for="poll-options">Options (one per line, 2–8)</label><textarea id="poll-options" name="options" required></textarea><button>Create poll</button></form>`
-    : '<p>Start a session to create polls.</p>'}
-      <ul>${polls || '<li>No polls yet.</li>'}</ul>
-    </section>
-    <section><h2>Questions and suggestions</h2>${discussions || '<p>No submissions yet.</p>'}</section>
     <section><h2>Class summary</h2>
       <p class="notice">The transcript is stored in this app. Generating a summary sends it to OpenAI. Review the generated draft before publishing.</p>
       ${sessionsResult.rows.length ? `<form method="post" action="/teacher/subjects/${subject.id}/summaries" data-ai-processing>${formCsrf(token)}
@@ -438,7 +434,7 @@ async function subjectPage(req, res, subject) {
         <label for="assignment-instructions">Instructions</label><textarea id="assignment-instructions" name="instructions" maxlength="5000" required></textarea>
         <label for="assignment-deadline">Deadline (optional)</label><input id="assignment-deadline" type="datetime-local" name="dueAt"><button>Create assignment</button>
       </form>${assignmentCards.join('') || '<p>No assignments yet.</p>'}
-    </section>`, token, active ? String(active.id) : 'teacher-live'));
+    </section>`, token));
 }
 
 app.get('/', (req, res) => {
@@ -738,7 +734,8 @@ app.get('/login', (req, res) => {
     <form method="post" action="/login">${formCsrf(token)}
       <label for="fullName">Full name</label><input id="fullName" name="fullName" autocomplete="username" required>
       <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
-      <button>Log in</button></form>`, token));
+      <button>Log in</button></form>
+    <p><a href="/manager/login">Management login</a></p>`, token));
 });
 
 app.post('/login', loginLimiter, requireCsrf, async (req, res, next) => {
@@ -850,6 +847,136 @@ app.get('/teacher/subjects/:subjectId', requireTeacher, async (req, res) => {
   const subject = await getOwnedSubject(req.session.teacherId, req.params.subjectId);
   if (!subject) return res.status(404).send('Subject not found.');
   await subjectPage(req, res, subject);
+});
+
+app.get('/teacher/sessions/:sessionId/live', requireTeacher, async (req, res) => {
+  if (!validId(req.params.sessionId)) return res.status(404).send('Active class session not found.');
+  const sessionResult = await pool.query(
+    `SELECT ts.id, ts.subject_id, sb.name AS subject_name
+     FROM teaching_sessions ts JOIN subjects sb ON sb.id = ts.subject_id
+     WHERE ts.id = $1 AND sb.teacher_id = $2 AND ts.ended_at IS NULL`,
+    [req.params.sessionId, req.session.teacherId],
+  );
+  if (!sessionResult.rowCount) return res.status(404).send('Active class session not found.');
+
+  const classSession = sessionResult.rows[0];
+  const [pollRows, discussionRows, chatRows] = await Promise.all([
+    pool.query(
+      `SELECT p.id, p.prompt, p.closed_at, po.id AS option_id, po.label, COUNT(v.id)::int AS votes
+       FROM polls p JOIN poll_options po ON po.poll_id = p.id
+       LEFT JOIN poll_votes v ON v.option_id = po.id
+       WHERE p.session_id = $1
+       GROUP BY p.id, po.id ORDER BY p.created_at DESC, po.id`,
+      [classSession.id],
+    ),
+    pool.query(
+      `SELECT di.*, st.full_name AS student_name FROM discussion_items di
+       JOIN students st ON st.id = di.student_id
+       WHERE di.session_id = $1 ORDER BY di.created_at DESC LIMIT 100`,
+      [classSession.id],
+    ),
+    pool.query(
+      `SELECT cm.id, cm.author_type, cm.body, cm.created_at,
+         COALESCE(t.full_name, st.full_name, cm.author_name) AS author_name
+       FROM (
+         SELECT * FROM live_chat_messages WHERE session_id = $1 ORDER BY id DESC LIMIT 100
+       ) cm
+       LEFT JOIN teachers t ON t.id = cm.teacher_id
+       LEFT JOIN students st ON st.id = cm.student_id
+       ORDER BY cm.id`,
+      [classSession.id],
+    ),
+  ]);
+  const groupedPolls = new Map();
+  for (const row of pollRows.rows) {
+    const pollId = String(row.id);
+    if (!groupedPolls.has(pollId)) groupedPolls.set(pollId, { ...row, options: [] });
+    groupedPolls.get(pollId).options.push(row);
+  }
+  const polls = [...groupedPolls.values()].map((poll) => `<article>
+    <h3>${escapeHtml(poll.prompt)}</h3>
+    <ul>${poll.options.map((option) => `<li>${escapeHtml(option.label)} — ${option.votes} vote${option.votes === 1 ? '' : 's'}</li>`).join('')}</ul>
+    ${poll.closed_at ? '<p class="muted">Poll closed.</p>'
+    : `<form method="post" action="/teacher/polls/${poll.id}/close">${formCsrf(csrfTokenFor(req))}
+       <button type="submit">Close poll</button></form>`}
+    </article>`).join('');
+  const discussions = discussionRows.rows.map((item) => `<article>
+    <p><strong>${escapeHtml(item.student_name)}</strong> · ${escapeHtml(item.visibility)}
+      · ${escapeHtml(new Date(item.created_at).toLocaleString())}</p>
+    <p>${escapeHtml(item.body)}</p>
+    ${item.teacher_reply ? `<p><strong>Teacher reply:</strong> ${escapeHtml(item.teacher_reply)}</p>` : ''}
+    <form method="post" action="/teacher/discussion/${item.id}">${formCsrf(csrfTokenFor(req))}
+      <label for="reply-${item.id}">Teacher reply</label>
+      <textarea id="reply-${item.id}" name="reply" maxlength="3000">${escapeHtml(item.teacher_reply || '')}</textarea>
+      <button name="action" value="reply">Save reply</button>
+      ${item.visibility === 'class' ? '<button name="action" value="hide">Hide from class</button>' : ''}
+    </form></article>`).join('');
+  const token = csrfTokenFor(req);
+  res.send(renderPage(`Live class - ${classSession.subject_name}`, `${teacherNavigation(req.session.teacherName, token)}
+    <h1>Live class: ${escapeHtml(classSession.subject_name)}</h1>
+    <p>These tools are available only while this class session is active.</p>
+    <p><a href="/teacher/subjects/${classSession.subject_id}">Back to subject management</a></p>
+    <section><h2>Live class chat</h2>
+      <p>Messages are visible to the class and saved to the database.</p>
+      ${renderChat(chatRows.rows, `/teacher/sessions/${classSession.id}/chat`,
+    `/teacher/sessions/${classSession.id}/chat`)}
+    </section>
+    <section><h2>Quick polls</h2>
+      <form method="post" action="/teacher/sessions/${classSession.id}/polls">${formCsrf(token)}
+        <label for="poll-prompt">Question</label><input id="poll-prompt" name="prompt" maxlength="500" required>
+        <label for="poll-options">Options (one per line, 2–8)</label><textarea id="poll-options" name="options" required></textarea>
+        <button type="submit">Create poll</button></form>
+      ${polls || '<p>No polls yet.</p>'}
+    </section>
+    <section><h2>Questions and suggestions</h2>${discussions || '<p>No submissions yet.</p>'}</section>
+    <form method="post" action="/teacher/sessions/${classSession.id}/end">${formCsrf(token)}
+      <button type="submit">End class session</button></form>`, token, String(classSession.id)));
+});
+
+app.get('/teacher/sessions/:sessionId/chat', requireTeacher, async (req, res) => {
+  const sessionId = String(req.params.sessionId);
+  const afterId = String(req.query.after ?? '0');
+  if (!validId(sessionId) || (afterId !== '0' && !validId(afterId))) {
+    return res.status(400).json({ error: 'Invalid chat request.' });
+  }
+  const active = await pool.query(
+    `SELECT 1 FROM teaching_sessions ts JOIN subjects sb ON sb.id = ts.subject_id
+     WHERE ts.id = $1 AND sb.teacher_id = $2 AND ts.ended_at IS NULL`,
+    [sessionId, req.session.teacherId],
+  );
+  if (!active.rowCount) return res.status(410).json({ error: 'This class session has ended.' });
+  const messages = await pool.query(
+    `SELECT cm.id, cm.author_type, cm.body, cm.created_at,
+       COALESCE(t.full_name, st.full_name, cm.author_name) AS author_name
+     FROM live_chat_messages cm LEFT JOIN teachers t ON t.id = cm.teacher_id
+     LEFT JOIN students st ON st.id = cm.student_id
+     WHERE cm.session_id = $1 AND cm.id > $2 ORDER BY cm.id LIMIT 100`,
+    [sessionId, afterId],
+  );
+  res.json({ messages: messages.rows });
+});
+
+app.post('/teacher/sessions/:sessionId/chat', requireTeacher, requireCsrf, async (req, res) => {
+  const sessionId = String(req.params.sessionId);
+  if (!validId(sessionId)) return res.status(404).json({ error: 'Active class session not found.' });
+  let body;
+  try {
+    body = validateChatMessage(req.body.body);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+  const active = await pool.query(
+    `SELECT 1 FROM teaching_sessions ts JOIN subjects sb ON sb.id = ts.subject_id
+     WHERE ts.id = $1 AND sb.teacher_id = $2 AND ts.ended_at IS NULL`,
+    [sessionId, req.session.teacherId],
+  );
+  if (!active.rowCount) return res.status(410).json({ error: 'This class session has ended.' });
+  const result = await pool.query(
+    `INSERT INTO live_chat_messages (session_id, author_type, teacher_id, author_name, body)
+     VALUES ($1, 'teacher', $2, $3, $4) RETURNING id, author_type, author_name, body, created_at`,
+    [sessionId, req.session.teacherId, req.session.teacherName, body],
+  );
+  res.status(201).json({ message: result.rows[0] });
 });
 
 app.post('/teacher/subjects/:subjectId/location', requireTeacher, requireCsrf, async (req, res) => {
@@ -1056,19 +1183,19 @@ app.post('/teacher/sessions/:sessionId/polls', requireTeacher, requireCsrf, asyn
   } finally {
     client.release();
   }
-  const subjectId = await pool.query('SELECT subject_id FROM teaching_sessions WHERE id = $1', [req.params.sessionId]);
-  res.redirect(303, `/teacher/subjects/${subjectId.rows[0].subject_id}`);
+  res.redirect(303, `/teacher/sessions/${req.params.sessionId}/live`);
 });
 
 app.post('/teacher/polls/:pollId/close', requireTeacher, requireCsrf, async (req, res) => {
   if (!validId(req.params.pollId)) return res.status(404).send('Poll not found.');
   const result = await pool.query(
     `UPDATE polls p SET closed_at = NOW() FROM teaching_sessions ts JOIN subjects sb ON sb.id = ts.subject_id
-     WHERE p.id = $1 AND p.session_id = ts.id AND sb.teacher_id = $2 RETURNING sb.id AS subject_id`,
+     WHERE p.id = $1 AND p.session_id = ts.id AND sb.teacher_id = $2 AND ts.ended_at IS NULL
+     RETURNING ts.id AS session_id`,
     [req.params.pollId, req.session.teacherId],
   );
   if (!result.rowCount) return res.status(404).send('Poll not found.');
-  res.redirect(303, `/teacher/subjects/${result.rows[0].subject_id}`);
+  res.redirect(303, `/teacher/sessions/${result.rows[0].session_id}/live`);
 });
 
 app.post('/teacher/discussion/:itemId', requireTeacher, requireCsrf, async (req, res) => {
@@ -1082,13 +1209,13 @@ app.post('/teacher/discussion/:itemId', requireTeacher, requireCsrf, async (req,
        teacher_reply = CASE WHEN $2 = 'reply' THEN $3 ELSE di.teacher_reply END,
        moderated_at = NOW()
      FROM teaching_sessions ts JOIN subjects sb ON sb.id = ts.subject_id
-     WHERE di.id = $1 AND di.session_id = ts.id AND sb.teacher_id = $4
+     WHERE di.id = $1 AND di.session_id = ts.id AND sb.teacher_id = $4 AND ts.ended_at IS NULL
        AND $2 IN ('reply', 'hide')
-     RETURNING sb.id AS subject_id`,
+     RETURNING ts.id AS session_id`,
     [req.params.itemId, action, reply, req.session.teacherId],
   );
   if (!result.rowCount) return res.status(404).send('Discussion item not found.');
-  res.redirect(303, `/teacher/subjects/${result.rows[0].subject_id}`);
+  res.redirect(303, `/teacher/sessions/${result.rows[0].session_id}/live`);
 });
 
 app.post('/teacher/subjects/:subjectId/assignments', requireTeacher, requireCsrf, async (req, res) => {
@@ -1297,21 +1424,134 @@ async function getStudentSession(req) {
   return result.rows[0] || null;
 }
 
-app.get('/student', async (req, res) => {
+app.get('/student/live', async (req, res) => {
   if (!req.session.studentId || !req.session.teachingSessionId) return res.redirect('/');
   const context = await getStudentSession(req);
   if (!context) return res.status(403).send('Your student session is no longer available.');
   const token = csrfTokenFor(req);
-  const [polls, assignments, summaries, discussions, attendance] = await Promise.all([
+  const [pollRows, discussionRows, chatRows] = await Promise.all([
     pool.query(
       `SELECT p.id, p.prompt, p.closed_at, po.id AS option_id, po.label,
          COUNT(v.id)::int AS votes, own.option_id AS own_vote
        FROM polls p JOIN poll_options po ON po.poll_id = p.id
        LEFT JOIN poll_votes v ON v.option_id = po.id
-       LEFT JOIN LATERAL (SELECT option_id FROM poll_votes WHERE poll_id = p.id AND student_id = $2) own ON TRUE
-       WHERE p.session_id = $1 GROUP BY p.id, po.id, own.option_id ORDER BY p.created_at DESC, po.id`,
+       LEFT JOIN LATERAL (
+         SELECT option_id FROM poll_votes WHERE poll_id = p.id AND student_id = $2
+       ) own ON TRUE
+       WHERE p.session_id = $1
+       GROUP BY p.id, po.id, own.option_id ORDER BY p.created_at DESC, po.id`,
       [context.session_id, req.session.studentId],
     ),
+    pool.query(
+      `SELECT body, teacher_reply, visibility, created_at FROM discussion_items
+       WHERE session_id = $1 AND (visibility = 'class' OR student_id = $2)
+       ORDER BY created_at DESC LIMIT 50`,
+      [context.session_id, req.session.studentId],
+    ),
+    pool.query(
+      `SELECT cm.id, cm.author_type, cm.body, cm.created_at,
+         COALESCE(t.full_name, st.full_name, cm.author_name) AS author_name
+       FROM (
+         SELECT * FROM live_chat_messages WHERE session_id = $1 ORDER BY id DESC LIMIT 100
+       ) cm
+       LEFT JOIN teachers t ON t.id = cm.teacher_id
+       LEFT JOIN students st ON st.id = cm.student_id
+       ORDER BY cm.id`,
+      [context.session_id],
+    ),
+  ]);
+  const groupedPolls = new Map();
+  for (const row of pollRows.rows) {
+    const pollId = String(row.id);
+    if (!groupedPolls.has(pollId)) groupedPolls.set(pollId, { ...row, options: [] });
+    groupedPolls.get(pollId).options.push(row);
+  }
+  const polls = [...groupedPolls.values()].map((poll) => `<article>
+    <h3>${escapeHtml(poll.prompt)}</h3>
+    ${poll.own_vote
+    ? `<p>Your vote is saved. ${poll.closed_at || context.ended_at ? 'Poll closed.' : 'Results:'}</p>
+       <ul>${poll.options.map((option) => `<li>${escapeHtml(option.label)} — ${option.votes}</li>`).join('')}</ul>`
+    : poll.closed_at || context.ended_at
+      ? `<p>Poll closed. Results:</p><ul>${poll.options.map((option) => `<li>${escapeHtml(option.label)} — ${option.votes}</li>`).join('')}</ul>`
+      : `<form data-queue="/student/votes"><input type="hidden" name="pollId" value="${poll.id}">
+         <label for="vote-option-${poll.id}">Choose an option</label>
+         <select id="vote-option-${poll.id}" name="optionId" required>${poll.options.map((option) =>
+    `<option value="${option.option_id}">${escapeHtml(option.label)}</option>`).join('')}</select>
+         <button type="submit">Submit vote</button>
+         <p id="vote-status-${poll.id}" data-submit-status role="status"></p></form>`}
+    </article>`).join('');
+  const questions = discussionRows.rows.map((item) => `<article>
+    <p>${escapeHtml(item.visibility)} · ${escapeHtml(new Date(item.created_at).toLocaleString())}</p>
+    <p>${escapeHtml(item.body)}</p>${item.teacher_reply ? `<p><strong>Teacher reply:</strong> ${escapeHtml(item.teacher_reply)}</p>` : ''}
+    </article>`).join('');
+  const questionForm = context.ended_at
+    ? '<p>Questions and polls are closed because this class session has ended.</p>'
+    : `<form data-queue="/student/questions">
+        <label for="question-message">Question or suggestion</label>
+        <textarea id="question-message" name="body" maxlength="3000" required></textarea>
+        <label for="question-visibility">Visibility</label>
+        <select id="question-visibility" name="visibility">
+          <option value="private_to_teacher">Private to teacher</option>
+          <option value="class">Visible to class</option>
+        </select>
+        <button type="submit">Send question or suggestion</button>
+        <p id="question-status" data-submit-status role="status"></p>
+      </form>`;
+
+  res.send(renderPage(`Live class - ${context.subject_name}`, `<h1>Live class: ${escapeHtml(context.subject_name)}</h1>
+    <p>Signed in as ${escapeHtml(context.student_name)}.</p>
+    <p><a href="/student">Back to class materials and attendance</a></p>
+    ${context.ended_at ? '<p class="notice">This class session has ended. New chat messages, questions, and votes are disabled.</p>' : ''}
+    <section><h2>Live class chat</h2>
+      <p>Messages are visible to the class and saved to the database.</p>
+      ${renderChat(chatRows.rows, '/student/live/chat', '/student/live/chat', Boolean(context.ended_at))}
+    </section>
+    <section><h2>Questions and suggestions</h2>${questionForm}${questions || '<p>No questions yet.</p>'}</section>
+    <section><h2>Polls</h2>${polls || '<p>No polls available.</p>'}</section>`,
+  token, context.ended_at ? '' : String(context.session_id), false, String(req.session.studentId)));
+});
+
+app.get('/student/live/chat', requireStudent, async (req, res) => {
+  const afterId = String(req.query.after ?? '0');
+  if (afterId !== '0' && !validId(afterId)) return res.status(400).json({ error: 'Invalid chat request.' });
+  const context = await getStudentSession(req);
+  if (!context) return res.status(403).json({ error: 'Your student session is no longer available.' });
+  if (context.ended_at) return res.status(410).json({ error: 'This class session has ended.' });
+  const messages = await pool.query(
+    `SELECT cm.id, cm.author_type, cm.body, cm.created_at,
+       COALESCE(t.full_name, st.full_name, cm.author_name) AS author_name
+     FROM live_chat_messages cm LEFT JOIN teachers t ON t.id = cm.teacher_id
+     LEFT JOIN students st ON st.id = cm.student_id
+     WHERE cm.session_id = $1 AND cm.id > $2 ORDER BY cm.id LIMIT 100`,
+    [context.session_id, afterId],
+  );
+  res.json({ messages: messages.rows });
+});
+
+app.post('/student/live/chat', requireStudent, requireCsrf, async (req, res) => {
+  let body;
+  try {
+    body = validateChatMessage(req.body.body);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+  const context = await getStudentSession(req);
+  if (!context) return res.status(403).json({ error: 'Your student session is no longer available.' });
+  if (context.ended_at) return res.status(410).json({ error: 'This class session has ended.' });
+  const result = await pool.query(
+    `INSERT INTO live_chat_messages (session_id, author_type, student_id, author_name, body)
+     VALUES ($1, 'student', $2, $3, $4) RETURNING id, author_type, author_name, body, created_at`,
+    [context.session_id, req.session.studentId, context.student_name, body],
+  );
+  res.status(201).json({ message: result.rows[0] });
+});
+
+app.get('/student', async (req, res) => {
+  if (!req.session.studentId || !req.session.teachingSessionId) return res.redirect('/');
+  const context = await getStudentSession(req);
+  if (!context) return res.status(403).send('Your student session is no longer available.');
+  const token = csrfTokenFor(req);
+  const [assignments, summaries, attendance] = await Promise.all([
     pool.query(
       `SELECT a.*, s.content AS own_content, sr.feedback, sr.status AS review_status
        FROM assignments a JOIN subject_students ss ON ss.subject_id = a.subject_id
@@ -1322,35 +1562,10 @@ app.get('/student', async (req, res) => {
     ),
     pool.query('SELECT summary FROM class_summaries WHERE session_id = $1 AND approved_at IS NOT NULL ORDER BY approved_at DESC', [context.session_id]),
     pool.query(
-      `SELECT body, teacher_reply, visibility, created_at FROM discussion_items
-       WHERE session_id = $1 AND (visibility = 'class' OR student_id = $2)
-       ORDER BY created_at DESC LIMIT 50`,
-      [context.session_id, req.session.studentId],
-    ),
-    pool.query(
       'SELECT status, recorded_at, accuracy_meters, detail FROM attendance_events WHERE session_id = $1 AND student_id = $2 ORDER BY recorded_at DESC LIMIT 1',
       [context.session_id, req.session.studentId],
     ),
   ]);
-  const groupedPolls = new Map();
-  for (const row of polls.rows) {
-    if (!groupedPolls.has(String(row.id))) {
-      groupedPolls.set(String(row.id), { ...row, options: [] });
-    }
-    groupedPolls.get(String(row.id)).options.push(row);
-  }
-  const pollMarkup = [...groupedPolls.values()].map((poll) =>
-    `<article><h3>${escapeHtml(poll.prompt)}</h3>
-     ${poll.own_vote
-    ? `<p>Your vote is saved. ${poll.closed_at ? 'Poll closed.' : 'Results:'}</p>
-       <ul>${poll.options.map((option) => `<li>${escapeHtml(option.label)} — ${option.votes}</li>`).join('')}</ul>`
-    : poll.closed_at || context.ended_at
-      ? `<p>Poll closed. Results:</p><ul>${poll.options.map((option) => `<li>${escapeHtml(option.label)} — ${option.votes}</li>`).join('')}</ul>`
-      : `<form data-queue="/student/votes"><input type="hidden" name="pollId" value="${poll.id}">
-         <label for="vote-option-${poll.id}">Choose an option</label><select id="vote-option-${poll.id}" name="optionId" required>${poll.options.map((option) =>
-    `<option value="${option.option_id}">${escapeHtml(option.label)}</option>`).join('')}</select>
-         <button>Submit vote</button><p id="vote-status-${poll.id}" data-submit-status role="status"></p></form>`}
-     </article>`).join('');
   const assignmentMarkup = assignments.rows.map((assignment) => {
     const submissionOpen = !assignment.due_at || new Date(assignment.due_at).getTime() >= Date.now();
     return `<article><h3>${escapeHtml(assignment.title)}</h3><p>${escapeHtml(assignment.instructions)}</p>
@@ -1366,6 +1581,7 @@ app.get('/student', async (req, res) => {
   const latest = attendance.rows[0];
   res.send(renderPage(`Student - ${context.subject_name}`, `<h1>${escapeHtml(context.subject_name)}</h1>
     <p>Signed in as ${escapeHtml(context.student_name)}.</p>
+    ${!context.ended_at ? '<p><a href="/student/live">Open live class participation</a></p>' : ''}
     <form class="inline" method="post" action="/student/leave" id="leave-class">${formCsrf(token)}<button>Leave this class</button></form>
   <p id="leave-status" role="status"></p>
     ${context.ended_at ? '<p class="notice">This class session has ended. New attendance checks and votes are disabled.</p>' : ''}
@@ -1376,16 +1592,6 @@ app.get('/student', async (req, res) => {
       ${!context.ended_at ? '<button id="check-location" type="button">Check location now</button>' : ''}
       <p class="muted">With permission, GPS is checked now and every 10 minutes while this page is open and active. Browser GPS may be inaccurate or unavailable.</p>
     </section>
-    <section><h2>Questions and suggestions</h2>
-      <form data-queue="/student/questions">
-        <label for="question-message">Message</label><textarea id="question-message" name="body" maxlength="3000" required></textarea>
-        <label for="question-visibility">Visibility</label><select id="question-visibility" name="visibility"><option value="private_to_teacher">Private to teacher</option><option value="class">Visible to class</option></select>
-        <button>Save message</button><p id="question-status" data-submit-status role="status"></p>
-      </form>
-      ${discussions.rows.map((item) => `<article><p>${escapeHtml(item.visibility)} · ${escapeHtml(new Date(item.created_at).toLocaleString())}</p>
-        <p>${escapeHtml(item.body)}</p>${item.teacher_reply ? `<p><strong>Teacher reply:</strong> ${escapeHtml(item.teacher_reply)}</p>` : ''}</article>`).join('')}
-    </section>
-    <section><h2>Polls</h2>${pollMarkup || '<p>No polls available.</p>'}</section>
     <section><h2>Class summaries</h2>${summaries.rows.length
     ? summaries.rows.map((row) => `<article><p><strong>Teacher-approved AI-generated summary</strong></p>${escapeHtml(row.summary)}</article>`).join('')
     : '<p>No teacher-approved summaries are available.</p>'}</section>

@@ -32,6 +32,9 @@ as the priority for the approximately 10-minute demo:
 - The application automatically saves the initial check-in and each subsequent check to PostgreSQL, attempting another check every 10 minutes while the student page is open and active.
 - The teacher sees saved attendance status. CSV is a convenience download, not the persistence mechanism.
 - The teacher can end the session; its QR code can no longer be used to join.
+- The subject QR code is collapsed until explicitly opened; its join link opens in a new tab.
+- Live participation (polls, questions/suggestions, and chat) is on a separate page and is only writable while the class session is active.
+- Students and teachers can send live chat messages; each message is saved to PostgreSQL and appears to other participants shortly after.
 - Students can submit questions/suggestions and poll votes; drafts can queue locally while offline.
 - Teachers can submit text transcripts for an OpenAI summary draft and approve/edit the draft before publication.
 - Teachers can create text-based assignments, request OpenAI feedback, and inspect local text-similarity indicators.
@@ -96,6 +99,7 @@ Managers, teachers, and students use separate authentication records and protect
 
 - **FR-06:** A teacher shall be able to start and end a session for a subject.
 - **FR-07:** Starting a session shall create a high-entropy, unguessable QR join link scoped to that session. Ending or replacing a session shall invalidate its previous link.
+- **FR-07a:** The teacher page shall keep the session QR code hidden until the teacher expands its control. The join link shall be available to open in a separate browser tab.
 - **FR-08:** A student shall be able to scan the QR code on a smartphone browser and join the matching session.
 - **FR-09:** The system shall automatically save a server-timestamped initial attendance event to PostgreSQL for an eligible student before confirming check-in. Saving shall not depend on a teacher action or CSV export.
 - **FR-10:** With permission, the student's browser shall submit a location check-in every 10 minutes while the session page remains active. The interface shall display the last check time and permission/accuracy status.
@@ -107,6 +111,9 @@ Managers, teachers, and students use separate authentication records and protect
 
 #### Questions, suggestions, and polls
 
+- **FR-15a:** The application shall provide a separate live-participation page for a currently active class session.
+- **FR-15b:** A teacher and enrolled students shall be able to send class chat messages during an active session. Messages shall be saved in PostgreSQL and delivered to other active participants through periodic refresh.
+- **FR-15c:** New chat messages, polls, votes, and questions shall be rejected after the associated class session ends.
 - **FR-16:** A student shall be able to submit a question or suggestion associated with an active subject session.
 - **FR-17:** A student shall be able to mark a submission as public to the class or private to the teacher.
 - **FR-18:** A teacher shall be able to view, answer, and moderate submissions. Private items shall not be exposed to other students.
@@ -157,9 +164,9 @@ Managers, teachers, and students use separate authentication records and protect
 
 | Component | Responsibility |
 |---|---|
-| Mobile-friendly web UI | Teacher dashboard, student join/check-in, attendance, polls, questions, summaries, and submissions. |
+| Mobile-friendly web UI | Teacher dashboard, student join/check-in, attendance, a separate live class page with chat/polls/questions, summaries, and submissions. |
 | Express application/API | Authentication, authorization, session management, validation, feature routes, and response formatting. |
-| PostgreSQL | Managers, teachers, students, subjects, teacher assignments, student memberships, class sessions, attendance events, polls, discussion, assignments, submissions, and persistent web sessions. |
+| PostgreSQL | Managers, teachers, students, subjects, teacher assignments, student memberships, class sessions, attendance events, live chat, polls, discussion, assignments, submissions, and persistent web sessions. |
 | QR/session service | Creates scoped random session tokens, renders QR images, and expires/revokes links. |
 | Attendance/location service | Validates check-in ownership, timestamps events, evaluates configurable geofence rules, and exports CSV. |
 | OpenAI adapter | Generates transcript summaries and homework feedback after teacher confirmation; model is configurable, while text similarity is calculated locally. |
