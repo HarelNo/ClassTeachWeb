@@ -6,6 +6,11 @@ function attendanceStatus(row, now = Date.now()) {
   if (adjustmentTime && (!eventTime || adjustmentTime >= eventTime)) {
     return { status: row.adjustment_status, at: row.adjustment_at, adjusted: true };
   }
+  const pulseCount = Number(row.gps_pulse_count || 0);
+  const failedPulseCount = Number(row.gps_pulse_failure_count || 0);
+  if (pulseCount > 0 && failedPulseCount * 4 > pulseCount) {
+    return { status: 'negative', at: row.recorded_at || row.gps_last_pulse_at, adjusted: false };
+  }
   if (!eventTime) return { status: 'unavailable', at: null, adjusted: false };
   if (now - eventTime > STALE_AFTER_MS) {
     return { status: 'stale', at: row.recorded_at, adjusted: false };

@@ -13,6 +13,13 @@ requirements, architecture, phased scope, and test strategy are in [SPEC.md](./S
 - Student roster selection and GPS geofence check-ins every 10 minutes while the
   student page is open and active. Check-in status and accuracy are saved
   automatically to PostgreSQL; raw GPS coordinates are evaluated but not retained.
+- A teacher can request an immediate GPS test from all enrolled students in an
+  active session. Student pages must be open and online; results appear in the
+  attendance table, while pages that do not respond remain clearly identified.
+- Every issued GPS pulse is recorded and available in the teacher's per-student
+  pulse history. Outside, unavailable, and no-result-after-two-minutes pulses
+  count as failures; attendance is negative only when failures exceed 25% of
+  that student's session pulses. Teacher corrections remain authoritative.
 - Teacher attendance view, manual corrections with audit records, and optional
   CSV download generated from saved attendance.
 - Quick polls with one saved vote per student, public/private questions, teacher
@@ -52,8 +59,14 @@ you open **Show student QR code**; its link opens the student join page in a new
 tab. From the subject page, choose **Open live class tools** for live chat, polls,
 and questions/suggestions. Students scan the QR code, join, then choose **Open
 live class participation** from their class page. Chat messages are saved to
-PostgreSQL and appear for other participants within a few seconds. Chat, polls,
-and questions stop accepting new activity when the teacher ends the session.
+PostgreSQL and appear for other participants within a few seconds. The teacher
+can also choose **Request GPS check from all enrolled students** in the attendance
+section to test GPS immediately; student pages must be open, online, and allowed
+to use location. Refresh the teacher page after a few seconds to see each result
+and open a student's **GPS pulses** history to review every check. More than 25%
+failed pulses in the session makes attendance negative; exactly 25% does not.
+Chat, polls, and questions stop accepting new activity when the teacher ends the
+session.
 
 Teacher login and management login link to each other from their respective
 login pages.

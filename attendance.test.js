@@ -29,3 +29,30 @@ test('teacher correction wins over earlier or same-time GPS evidence', () => {
     adjusted: true,
   });
 });
+
+test('attendance becomes negative only when failed GPS pulses exceed 25 percent', () => {
+  const now = Date.parse('2026-11-23T12:00:00Z');
+  const base = {
+    recorded_at: '2026-11-23T11:59:00Z',
+    event_status: 'inside',
+    gps_pulse_count: 4,
+    gps_pulse_failure_count: 1,
+  };
+  assert.equal(attendanceStatus(base, now).status, 'inside');
+  assert.equal(attendanceStatus({
+    ...base,
+    gps_pulse_count: 5,
+    gps_pulse_failure_count: 2,
+  }, now).status, 'negative');
+});
+
+test('teacher correction remains authoritative over the GPS pulse threshold', () => {
+  const row = {
+    event_status: 'outside',
+    gps_pulse_count: 5,
+    gps_pulse_failure_count: 3,
+    adjustment_at: '2026-11-23T11:59:00Z',
+    adjustment_status: 'inside',
+  };
+  assert.equal(attendanceStatus(row, Date.parse('2026-11-23T12:00:00Z')).status, 'inside');
+});

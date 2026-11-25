@@ -260,7 +260,8 @@ async function getAttendanceRows(sessionId) {
     `SELECT st.id AS student_id, st.full_name, st.email,
        first_event.first_at, latest.recorded_at, latest.status AS event_status,
        latest.accuracy_meters, adjustment.status AS adjustment_status,
-       adjustment.created_at AS adjustment_at, adjustment.reason, adjustment.teacher_name
+       adjustment.created_at AS adjustment_at, adjustment.reason, adjustment.teacher_name,
+       gps.gps_pulse_count, gps.gps_pulse_failure_count, gps.gps_last_pulse_at, gps.gps_pulses
      FROM teaching_sessions ts
      JOIN subjects sb ON sb.id = ts.subject_id
      JOIN subject_students ss ON ss.subject_id = sb.id
@@ -280,22 +281,66 @@ async function getAttendanceRows(sessionId) {
        WHERE aa.session_id = ts.id AND aa.student_id = st.id
        ORDER BY aa.created_at DESC, aa.id DESC LIMIT 1
      ) adjustment ON TRUE
+     LEFT JOIN LATERAL (
+       SELECT COUNT(*)::int AS gps_pulse_count,
+         COUNT(*) FILTER (
+           WHERE status IN ('outside', 'unavailable')
+             OR (status IN ('pending', 'checking')
+               AND requested_at <= NOW() - INTERVAL '2 minutes')
+         )::int AS gps_pulse_failure_count,
+         MAX(requested_at) AS gps_last_pulse_at,
+         COALESCE(
+           json_agg(json_build_object(
+             'id', id,
+             'source', source,
+             'status', CASE
+               WHEN status IN ('pending', 'checking')
+                 AND requested_at <= NOW() - INTERVAL '2 minutes' THEN 'no_response'
+               ELSE status
+             END,
+             'requestedAt', requested_at,
+             'accuracyMeters', accuracy_meters,
+             'detail', detail
+           ) ORDER BY id),
+           '[]'::json
+         ) AS gps_pulses
+       FROM gps_check_requests
+       WHERE session_id = ts.id AND student_id = st.id
+     ) gps ON TRUE
      WHERE ts.id = $1
      ORDER BY lower(st.full_name)`,
     [sessionId],
   );
-  return result.rows.map((row) => ({ ...row, ...attendanceStatus(row) }));
+  return result.rows.map((row) => ({
+    ...row,
+    ...attendanceStatus(row),
+  }));
 }
 
 function renderAttendanceTable(rows, subjectSessionId, csrfToken) {
   if (rows.length === 0) return '<p>No students are enrolled in this subject yet.</p>';
-  return `<table><thead><tr><th>Student</th><th>Status</th><th>First check-in</th><th>Last evidence</th><th>Accuracy</th><th>Teacher correction</th></tr></thead><tbody>
+  return `<table><thead><tr><th>Student</th><th>Status</th><th>First check-in</th><th>Last evidence</th><th>Accuracy</th><th>GPS pulses</th><th>Teacher correction</th></tr></thead><tbody>
     ${rows.map((row) => `<tr><td>${escapeHtml(row.full_name)}<br><span class="muted">${escapeHtml(row.email)}</span></td>
       <td class="status">${escapeHtml(row.status)}${row.adjusted
     ? `<br><span class="muted">Teacher correction by ${escapeHtml(row.teacher_name)}: ${escapeHtml(row.reason)}</span>` : ''}</td>
       <td>${row.first_at ? escapeHtml(new Date(row.first_at).toLocaleString()) : '—'}</td>
       <td>${row.at ? escapeHtml(new Date(row.at).toLocaleString()) : '—'}</td>
       <td>${row.accuracy_meters ? `${Math.round(row.accuracy_meters)} m` : '—'}</td>
+      <td>${row.gps_pulse_count
+    ? `<p>${row.gps_pulse_failure_count} failed / ${row.gps_pulse_count} total</p>
+        <details><summary>View pulse history</summary><ol>${row.gps_pulses.map((pulse) => {
+    const source = {
+      automatic: 'Automatic',
+      'student-manual': 'Student manual',
+      'teacher-requested': 'Teacher requested',
+      legacy: 'Previous check-in',
+    }[pulse.source] || pulse.source;
+    const requestStatus = String(pulse.status).replaceAll('_', ' ');
+    const accuracy = pulse.accuracyMeters === null ? '' : ` — GPS accuracy ${Math.round(pulse.accuracyMeters)} m`;
+    const detail = pulse.detail ? ` — ${String(pulse.detail).replaceAll('-', ' ')}` : '';
+    return `<li>${escapeHtml(new Date(pulse.requestedAt).toLocaleString())}: ${escapeHtml(source)} — ${escapeHtml(requestStatus)}${accuracy}${detail}</li>`;
+  }).join('')}</ol></details>`
+    : 'No GPS pulses yet'}</td>
       <td><form method="post" action="/teacher/sessions/${subjectSessionId}/attendance/${row.student_id}">
         ${formCsrf(csrfToken)}        <select name="status" aria-label="Attendance status for ${escapeHtml(row.full_name)}" required>
           <option value="" selected disabled>Choose status</option>
@@ -308,6 +353,10 @@ function renderAttendanceTable(rows, subjectSessionId, csrfToken) {
 
 async function subjectPage(req, res, subject) {
   const token = csrfTokenFor(req);
+  const gpsCheckRequestCount = Number(req.query.gpsCheckRequested);
+  const gpsCheckNotice = Number.isSafeInteger(gpsCheckRequestCount) && gpsCheckRequestCount > 0
+    ? `<p class="notice" role="status">GPS check requested from ${gpsCheckRequestCount} enrolled student${gpsCheckRequestCount === 1 ? '' : 's'}. Refresh this page after a few seconds to see responses in the GPS test column.</p>`
+    : '';
   const [rosterResult, enrolledResult, sessionsResult, assignmentsResult, summariesResult] = await Promise.all([
     pool.query('SELECT id, full_name, email FROM students ORDER BY lower(full_name)'),
     pool.query('SELECT student_id FROM subject_students WHERE subject_id = $1', [subject.id]),
@@ -416,7 +465,14 @@ async function subjectPage(req, res, subject) {
     : '<p>Start a class session to enable live participation tools.</p>'}
     </section>
     <section><h2>Automatically saved attendance</h2>
-      <p>Every accepted check-in and teacher correction is saved to PostgreSQL automatically. CSV is a convenience download only.</p>${attendanceContent}
+      <p>Every accepted check-in and teacher correction is saved to PostgreSQL automatically. CSV is a convenience download only.</p>
+      ${active ? `<form method="post" action="/teacher/sessions/${active.id}/gps-checks">${formCsrf(token)}
+        <button type="submit">Request GPS check from all enrolled students</button>
+      </form>
+      <p class="muted">For testing, this asks each student’s active browser page to check GPS now. Students must be online, keep the page open, and allow location access.</p>` : ''}
+      ${gpsCheckNotice}
+      <p class="muted">Attendance is negative when more than 25% of a student's session pulses are outside, unavailable, or have no result after two minutes. Teacher corrections remain authoritative.</p>
+      ${attendanceContent}
     </section>
     <section><h2>Class summary</h2>
       <p class="notice">The transcript is stored in this app. Generating a summary sends it to OpenAI. Review the generated draft before publishing.</p>
@@ -1108,6 +1164,32 @@ app.post('/teacher/sessions/:sessionId/end', requireTeacher, requireCsrf, async 
   res.redirect(303, `/teacher/subjects/${subjectId}`);
 });
 
+app.post('/teacher/sessions/:sessionId/gps-checks', requireTeacher, requireCsrf, async (req, res) => {
+  if (!validId(req.params.sessionId)) return res.status(404).send('Active class session not found.');
+  const result = await pool.query(
+    `WITH active_session AS (
+       SELECT ts.id, ts.subject_id, sb.teacher_id
+       FROM teaching_sessions ts JOIN subjects sb ON sb.id = ts.subject_id
+       WHERE ts.id = $1 AND sb.teacher_id = $2 AND ts.ended_at IS NULL
+     ),
+     requested AS (
+       INSERT INTO gps_check_requests (session_id, student_id, teacher_id, source)
+       SELECT active_session.id, ss.student_id, active_session.teacher_id, 'teacher-requested'
+       FROM active_session
+       JOIN subject_students ss ON ss.subject_id = active_session.subject_id
+       RETURNING session_id
+     )
+     SELECT active_session.subject_id, COUNT(requested.session_id)::int AS request_count
+     FROM active_session LEFT JOIN requested ON requested.session_id = active_session.id
+     GROUP BY active_session.subject_id`,
+    [req.params.sessionId, req.session.teacherId],
+  );
+  if (!result.rowCount) return res.status(404).send('Active class session not found.');
+  const { subject_id: subjectId, request_count: requestCount } = result.rows[0];
+  if (requestCount === 0) return res.status(400).send('Enroll at least one student before requesting GPS checks.');
+  res.redirect(303, `/teacher/subjects/${subjectId}?gpsCheckRequested=${requestCount}`);
+});
+
 app.get('/teacher/sessions/:sessionId/attendance.csv', requireTeacher, async (req, res) => {
   if (!validId(req.params.sessionId)) return res.status(404).send('Session not found.');
   const owned = await pool.query(
@@ -1118,11 +1200,13 @@ app.get('/teacher/sessions/:sessionId/attendance.csv', requireTeacher, async (re
   if (!owned.rowCount) return res.status(404).send('Session not found.');
   const rows = await getAttendanceRows(req.params.sessionId);
   const csv = [
-    ['Student', 'Email', 'Status', 'First check-in', 'Last evidence', 'GPS accuracy (m)'],
+    ['Student', 'Email', 'Status', 'First check-in', 'Last evidence', 'GPS accuracy (m)', 'GPS pulses', 'Failed GPS pulses'],
     ...rows.map((row) => [row.full_name, row.email, row.status,
       row.first_at ? new Date(row.first_at).toISOString() : '',
       row.at ? new Date(row.at).toISOString() : '',
-      row.accuracy_meters ? Math.round(row.accuracy_meters) : '']),
+      row.accuracy_meters ? Math.round(row.accuracy_meters) : '',
+      row.gps_pulse_count || 0,
+      row.gps_pulse_failure_count || 0]),
   ].map((line) => line.map(csvCell).join(',')).join('\r\n');
   res.type('text/csv').set('Content-Disposition', `attachment; filename="attendance-${owned.rows[0].id}.csv"`)
     .send(`\uFEFF${csv}`);
@@ -1429,7 +1513,7 @@ app.get('/student/live', async (req, res) => {
   const context = await getStudentSession(req);
   if (!context) return res.status(403).send('Your student session is no longer available.');
   const token = csrfTokenFor(req);
-  const [pollRows, discussionRows, chatRows] = await Promise.all([
+  const [pollRows, discussionRows, chatRows, attendanceRows] = await Promise.all([
     pool.query(
       `SELECT p.id, p.prompt, p.closed_at, po.id AS option_id, po.label,
          COUNT(v.id)::int AS votes, own.option_id AS own_vote
@@ -1458,6 +1542,11 @@ app.get('/student/live', async (req, res) => {
        LEFT JOIN students st ON st.id = cm.student_id
        ORDER BY cm.id`,
       [context.session_id],
+    ),
+    pool.query(
+      `SELECT status, recorded_at, accuracy_meters, detail FROM attendance_events
+       WHERE session_id = $1 AND student_id = $2 ORDER BY recorded_at DESC LIMIT 1`,
+      [context.session_id, req.session.studentId],
     ),
   ]);
   const groupedPolls = new Map();
@@ -1497,18 +1586,25 @@ app.get('/student/live', async (req, res) => {
         <button type="submit">Send question or suggestion</button>
         <p id="question-status" data-submit-status role="status"></p>
       </form>`;
+  const latestAttendance = attendanceRows.rows[0];
 
   res.send(renderPage(`Live class - ${context.subject_name}`, `<h1>Live class: ${escapeHtml(context.subject_name)}</h1>
     <p>Signed in as ${escapeHtml(context.student_name)}.</p>
     <p><a href="/student">Back to class materials and attendance</a></p>
     ${context.ended_at ? '<p class="notice">This class session has ended. New chat messages, questions, and votes are disabled.</p>' : ''}
+    <section><h2>GPS check-in</h2>
+      <p id="checkin-status" role="status">${latestAttendance
+    ? `Last saved status: ${escapeHtml(latestAttendance.status)}${latestAttendance.accuracy_meters ? ` — GPS accuracy ${Math.round(latestAttendance.accuracy_meters)} m` : latestAttendance.detail ? ` — ${escapeHtml(latestAttendance.detail.replaceAll('-', ' '))}` : ''} at ${escapeHtml(new Date(latestAttendance.recorded_at).toLocaleString())}`
+    : 'Waiting for first GPS check-in.'}</p>
+      ${!context.ended_at ? '<button id="check-location" type="button">Check location now</button><p class="muted">Allow location access. GPS is checked automatically while this live page is open and active.</p>' : ''}
+    </section>
     <section><h2>Live class chat</h2>
       <p>Messages are visible to the class and saved to the database.</p>
       ${renderChat(chatRows.rows, '/student/live/chat', '/student/live/chat', Boolean(context.ended_at))}
     </section>
     <section><h2>Questions and suggestions</h2>${questionForm}${questions || '<p>No questions yet.</p>'}</section>
     <section><h2>Polls</h2>${polls || '<p>No polls available.</p>'}</section>`,
-  token, context.ended_at ? '' : String(context.session_id), false, String(req.session.studentId)));
+  token, context.ended_at ? '' : String(context.session_id), !context.ended_at, String(req.session.studentId)));
 });
 
 app.get('/student/live/chat', requireStudent, async (req, res) => {
@@ -1607,9 +1703,57 @@ app.post('/student/leave', requireCsrf, (req, res) => {
   res.redirect('/');
 });
 
+app.post('/student/checkin/start', requireStudent, requireCsrf, async (req, res) => {
+  const context = await getStudentSession(req);
+  if (!context) return res.status(403).json({ error: 'Your student session is no longer available.' });
+  if (context.ended_at) return res.status(410).json({ error: 'This class session has ended.' });
+  const source = req.body.source;
+  if (!['automatic', 'student-manual'].includes(source)) {
+    return res.status(400).json({ error: 'Invalid GPS pulse source.' });
+  }
+  const result = await pool.query(
+    `INSERT INTO gps_check_requests
+       (session_id, student_id, teacher_id, source, status, dispatched_at)
+     SELECT ts.id, $2, sb.teacher_id, $3, 'checking', NOW()
+     FROM teaching_sessions ts JOIN subjects sb ON sb.id = ts.subject_id
+     JOIN subject_students ss ON ss.subject_id = sb.id AND ss.student_id = $2
+     WHERE ts.id = $1 AND ts.ended_at IS NULL
+     RETURNING id`,
+    [context.session_id, req.session.studentId, source],
+  );
+  if (!result.rowCount) return res.status(410).json({ error: 'This class session has ended.' });
+  res.status(201).json({ pulseId: result.rows[0].id });
+});
+
+app.get('/student/checkin-request', requireStudent, async (req, res) => {
+  const context = await getStudentSession(req);
+  if (!context) return res.status(403).json({ error: 'Your student session is no longer available.' });
+  if (context.ended_at) return res.status(410).json({ error: 'This class session has ended.' });
+  const result = await pool.query(
+    `WITH next_request AS (
+       SELECT id FROM gps_check_requests
+       WHERE session_id = $1 AND student_id = $2
+         AND source = 'teacher-requested' AND status = 'pending'
+         AND requested_at >= NOW() - INTERVAL '2 minutes'
+       ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED
+     )
+     UPDATE gps_check_requests AS request
+     SET status = 'checking', dispatched_at = NOW()
+     FROM next_request
+     WHERE request.id = next_request.id
+     RETURNING request.id`,
+    [context.session_id, req.session.studentId],
+  );
+  res.json({ requestId: result.rows[0]?.id || null });
+});
+
 app.post('/student/checkin', requireStudent, requireCsrf, async (req, res) => {
   const context = await getStudentSession(req);
   if (!context || context.ended_at) return res.status(410).json({ error: 'This class session has ended.' });
+  const requestId = req.body.requestId === undefined ? null : String(req.body.requestId);
+  if (requestId !== null && !validId(requestId)) {
+    return res.status(400).json({ error: 'Invalid GPS check request.' });
+  }
   const latitude = typeof req.body.latitude === 'number' ? req.body.latitude : NaN;
   const longitude = typeof req.body.longitude === 'number' ? req.body.longitude : NaN;
   const accuracy = typeof req.body.accuracyMeters === 'number' ? req.body.accuracyMeters : NaN;
@@ -1626,20 +1770,61 @@ app.post('/student/checkin', requireStudent, requireCsrf, async (req, res) => {
     ? req.body.reason : null;
   const detail = evaluation.status === 'unavailable'
     ? reason || 'location-or-accuracy-unavailable' : null;
-  const result = await pool.query(
-    `INSERT INTO attendance_events
-       (session_id, student_id, latitude, longitude, accuracy_meters, status, detail)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING recorded_at, detail`,
-    [context.session_id, req.session.studentId,
-      null, null,
-      Number.isFinite(accuracy) && accuracy >= 0 ? accuracy : null,
-      evaluation.status, detail],
-  );
+  const client = await pool.connect();
+  let recordedAt;
+  let savedDetail;
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `INSERT INTO attendance_events
+         (session_id, student_id, latitude, longitude, accuracy_meters, status, detail)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING recorded_at, detail`,
+      [context.session_id, req.session.studentId,
+        null, null,
+        Number.isFinite(accuracy) && accuracy >= 0 ? accuracy : null,
+        evaluation.status, detail],
+    );
+    if (requestId !== null) {
+      const requestResult = await client.query(
+        `UPDATE gps_check_requests
+         SET status = $4, detail = $5, accuracy_meters = $6,
+           attendance_event_id = $7, completed_at = NOW()
+         WHERE id = $1 AND session_id = $2 AND student_id = $3 AND status = 'checking'
+         RETURNING id`,
+        [requestId, context.session_id, req.session.studentId, evaluation.status, detail,
+          Number.isFinite(accuracy) && accuracy >= 0 ? accuracy : null, result.rows[0].id],
+      );
+      if (!requestResult.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'This GPS test request has expired. Try checking location again.' });
+      }
+    } else {
+      await client.query(
+        `INSERT INTO gps_check_requests
+           (session_id, student_id, teacher_id, source, requested_at, dispatched_at,
+            completed_at, accuracy_meters, attendance_event_id, status, detail)
+         SELECT $1, $2, sb.teacher_id, 'legacy', $3, $3, $3, $4, $5, $6, $7
+         FROM subjects sb
+         WHERE sb.id = $8`,
+        [context.session_id, req.session.studentId, result.rows[0].recorded_at,
+          Number.isFinite(accuracy) && accuracy >= 0 ? accuracy : null,
+          result.rows[0].id, evaluation.status, detail, context.subject_id],
+      );
+    }
+    await client.query('COMMIT');
+    recordedAt = result.rows[0].recorded_at;
+    savedDetail = result.rows[0].detail;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
   res.json({
     status: evaluation.status,
-    recordedAt: result.rows[0].recorded_at,
+    recordedAt,
     accuracyMeters: Number.isFinite(accuracy) && accuracy >= 0 ? Math.round(accuracy) : null,
-    detail: result.rows[0].detail,
+    detail: savedDetail,
   });
 });
 

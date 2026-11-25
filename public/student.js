@@ -7,6 +7,8 @@
   const openDetailsKey = `classteachweb-open-details-${liveSession}-${studentId}`;
   const checkinStatus = document.getElementById('checkin-status');
   let checkinInFlight = false;
+  let checkinRequestPollInFlight = false;
+  let pendingGpsRequestId = null;
   let sessionStorageAvailable = true;
 
   try {
@@ -83,6 +85,15 @@
       sessionStorage.setItem(lastCheckinKey, String(Date.now()));
     } catch {
       sessionStorageAvailable = false;
+    }
+  }
+
+  function finishCheckin() {
+    checkinInFlight = false;
+    if (pendingGpsRequestId) {
+      const nextRequestId = pendingGpsRequestId;
+      pendingGpsRequestId = null;
+      window.setTimeout(() => checkLocation(true, nextRequestId), 0);
     }
   }
 
@@ -181,9 +192,16 @@
     sessionStorage.removeItem(lastCheckinKey);
   });
 
-  async function checkLocation(force = false) {
-    if (!checkinStatus || document.body.dataset.checkinsEnabled !== 'true'
-      || !navigator.onLine || document.visibilityState !== 'visible' || checkinInFlight) return;
+  async function checkLocation(force = false, requestId = null) {
+    if (!checkinStatus || document.body.dataset.checkinsEnabled !== 'true') return;
+    if (!navigator.onLine || document.visibilityState !== 'visible') {
+      if (requestId) pendingGpsRequestId = requestId;
+      return;
+    }
+    if (checkinInFlight) {
+      if (requestId) pendingGpsRequestId = requestId;
+      return;
+    }
     let lastCheckin = 0;
     try {
       lastCheckin = Number(sessionStorage.getItem(lastCheckinKey) || 0);
@@ -192,8 +210,24 @@
     }
     if (!force && Date.now() - lastCheckin < 10 * 60 * 1000) return;
     checkinInFlight = true;
-    if (navigator.geolocation && sessionStorageAvailable) rememberCheckin();
+    let pulseId = requestId;
+    if (!pulseId) {
+      try {
+        const pulse = await send('/student/checkin/start', {
+          source: force ? 'student-manual' : 'automatic',
+        });
+        if (!pulse.pulseId) throw new Error('The server did not create a GPS pulse. Reload and try again.');
+        pulseId = pulse.pulseId;
+      } catch (error) {
+        checkinStatus.textContent = error.message;
+        finishCheckin();
+        return;
+      }
+    }
+    if (sessionStorageAvailable) rememberCheckin();
+    checkinStatus.textContent = 'Checking GPS location…';
     const saveStatus = async (payload) => {
+      payload.requestId = pulseId;
       try {
         const result = await send('/student/checkin', payload);
         const accuracy = result.accuracyMeters === null
@@ -204,7 +238,7 @@
       } catch (error) {
         checkinStatus.textContent = error.message;
       } finally {
-        checkinInFlight = false;
+        finishCheckin();
       }
     };
     if (!navigator.geolocation) {
@@ -225,10 +259,28 @@
     }, { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
   }
 
+  async function checkForTeacherGpsRequest() {
+    if (document.body.dataset.checkinsEnabled !== 'true'
+      || !liveSession || !navigator.onLine || document.visibilityState !== 'visible'
+      || checkinRequestPollInFlight) return;
+    checkinRequestPollInFlight = true;
+    try {
+      const response = await fetch('/student/checkin-request', { credentials: 'same-origin' });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || 'Could not check for a teacher GPS request.');
+      if (result.requestId) checkLocation(true, result.requestId);
+    } catch (error) {
+      if (checkinStatus) checkinStatus.textContent = error.message;
+    } finally {
+      checkinRequestPollInFlight = false;
+    }
+  }
+
   flushQueue();
   window.addEventListener('online', () => {
     flushQueue();
     checkLocation();
+    checkForTeacherGpsRequest();
   });
   if (liveSession && (!checkinStatus || sessionStorageAvailable)) {
     window.setInterval(() => {
@@ -244,7 +296,14 @@
     window.setInterval(checkLocation, 10 * 60 * 1000);
     document.getElementById('check-location')?.addEventListener('click', () => checkLocation(true));
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') checkLocation();
+      if (document.visibilityState === 'visible') {
+        checkLocation();
+        checkForTeacherGpsRequest();
+      }
     });
+  }
+  if (liveSession && document.body.dataset.checkinsEnabled === 'true') {
+    checkForTeacherGpsRequest();
+    window.setInterval(checkForTeacherGpsRequest, 5000);
   }
 })();

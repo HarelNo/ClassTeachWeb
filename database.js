@@ -99,6 +99,50 @@ async function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS attendance_events_session_student_time_idx
       ON attendance_events (session_id, student_id, recorded_at DESC);
 
+    CREATE TABLE IF NOT EXISTS gps_check_requests (
+      id BIGSERIAL PRIMARY KEY,
+      session_id BIGINT NOT NULL REFERENCES teaching_sessions(id) ON DELETE CASCADE,
+      student_id BIGINT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+      teacher_id BIGINT NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
+      source TEXT NOT NULL DEFAULT 'teacher-requested'
+        CHECK (source IN ('automatic', 'student-manual', 'teacher-requested', 'legacy')),
+      requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      dispatched_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ,
+      accuracy_meters DOUBLE PRECISION CHECK (accuracy_meters IS NULL OR accuracy_meters >= 0),
+      attendance_event_id BIGINT UNIQUE REFERENCES attendance_events(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'checking', 'inside', 'outside', 'unavailable')),
+      detail TEXT
+    );
+    ALTER TABLE gps_check_requests
+      ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'teacher-requested';
+    ALTER TABLE gps_check_requests
+      ADD COLUMN IF NOT EXISTS accuracy_meters DOUBLE PRECISION;
+    ALTER TABLE gps_check_requests
+      ADD COLUMN IF NOT EXISTS attendance_event_id BIGINT UNIQUE REFERENCES attendance_events(id) ON DELETE CASCADE;
+    CREATE INDEX IF NOT EXISTS gps_check_requests_session_student_idx
+      ON gps_check_requests (session_id, student_id, id DESC);
+    INSERT INTO gps_check_requests
+      (session_id, student_id, teacher_id, source, requested_at, dispatched_at,
+       completed_at, accuracy_meters, attendance_event_id, status, detail)
+    SELECT event.session_id, event.student_id, sb.teacher_id, 'legacy',
+      event.recorded_at, event.recorded_at, event.recorded_at, event.accuracy_meters,
+      event.id, event.status, event.detail
+    FROM attendance_events event
+    JOIN teaching_sessions ts ON ts.id = event.session_id
+    JOIN subjects sb ON sb.id = ts.subject_id
+    WHERE NOT EXISTS (
+      SELECT 1 FROM gps_check_requests pulse WHERE pulse.attendance_event_id = event.id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM gps_check_requests pulse
+        WHERE pulse.session_id = event.session_id AND pulse.student_id = event.student_id
+          AND pulse.status = event.status
+          AND pulse.completed_at BETWEEN event.recorded_at - INTERVAL '2 minutes'
+            AND event.recorded_at + INTERVAL '2 minutes'
+    );
+
     CREATE TABLE IF NOT EXISTS attendance_adjustments (
       id BIGSERIAL PRIMARY KEY,
       session_id BIGINT NOT NULL REFERENCES teaching_sessions(id) ON DELETE CASCADE,
